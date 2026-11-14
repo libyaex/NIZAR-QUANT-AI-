@@ -1,9 +1,10 @@
 """Persistent background trading engine.
 
 Runs continuously on Railway independent of frontend connections:
-market data ingestion, scanner, analysis, probability updates, decision
-evaluation. Opening real positions happens ONLY when trading is explicitly
-activated via persisted state transitions (START/STOP/HALT).
+market data ingestion (native exchange WebSockets + REST), scanner, analysis,
+probability updates, decision evaluation. Opening real positions happens
+ONLY when trading is explicitly activated via persisted state transitions
+(START/STOP/HALT).
 """
 import asyncio
 import logging
@@ -18,6 +19,7 @@ from app.engine.mission import MissionEngine
 from app.engine.probability import ProbabilityEngine
 from app.engine.risk import RiskManager
 from app.engine.scanner import MarketScanner
+from app.engine.websocket_feeds import ExchangeWebSocketFeed
 from app.exchanges.adapter import ExchangeAdapter
 from app.models import (
     EngineStatusOut,
@@ -51,14 +53,15 @@ class TradingEngine:
         self.adapters: Dict[str, ExchangeAdapter] = {}
         self.scanners: Dict[str, MarketScanner] = {}
         self.executors: Dict[str, ExecutionEngine] = {}
+        self.ws_feeds: Dict[str, ExchangeWebSocketFeed] = {}
         self.recorders: Dict[str, TradeRecorder] = {}
         self.missions: Dict[str, MissionEngine] = {}
         self.opportunities: List[Opportunity] = []
+        self.equity: float = 0.0
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._last_scan = 0.0
         self._vault: Optional[CredentialVault] = None
-        # user whose persisted trading state we restore on startup
         self._state_user_id: Optional[str] = None
 
     async def start(self) -> asyncio.Task:
@@ -69,6 +72,9 @@ class TradingEngine:
 
     async def stop(self) -> None:
         self._running = False
+        for feed in self.ws_feeds.values():
+            await feed.stop()
+        self.ws_feeds.clear()
         for adapter in self.adapters.values():
             await adapter.close()
         self.adapters.clear()
@@ -78,9 +84,9 @@ class TradingEngine:
             self._vault = CredentialVault(self.settings.credential_encryption_key)
 
     async def _restore_state_on_startup(self) -> None:
-        """Restore the persisted trading state (app_state table) after a
-        backend restart so a Railway redeploy never silently re-enables or
-        disables live trading."""
+        """Restore persisted settings and trading state after a backend
+        restart so a Railway redeploy neither loses the user's risk/scanner
+        configuration nor silently re-enables live trading."""
         try:
             resp = self.db.table("app_state").select("*").order("updated_at", desc=True).limit(1).execute()
             rows = resp.data or []
@@ -94,17 +100,75 @@ class TradingEngine:
             state_value = row.get("state")
             if state_value:
                 self.state = TradingState(state_value)
-                if self.state == TradingState.trading_active:
-                    # Do NOT auto-open positions before exchanges are loaded;
-                    # entries require adapters, created on first API call.
-                    logger.info("restored trading state: %s (pending exchange load)", self.state.value)
-                else:
-                    logger.info("restored trading state: %s", self.state.value)
+                logger.info("restored trading state: %s", self.state.value)
             self._state_user_id = row.get("user_id")
             if self._state_user_id:
                 self.recorders[self._state_user_id] = TradeRecorder(self.db, self._state_user_id)
         except Exception as exc:
             logger.warning("state restore parse failed: %s", exc)
+        # restore saved risk + scanner settings (written by PUT /settings endpoints)
+        try:
+            resp = self.db.table("user_settings").select("*").limit(1).execute()
+            rows = resp.data or []
+            if rows:
+                saved = rows[0]
+                risk_saved = saved.get("risk_settings") or {}
+                if risk_saved:
+                    self.risk.settings_update(RiskSettings(**risk_saved))
+                    logger.info("restored risk settings")
+                scanner_saved = saved.get("scanner_settings") or {}
+                if scanner_saved:
+                    self.scanner_config = ScannerConfig(**scanner_saved)
+                    logger.info("restored scanner settings")
+        except Exception as exc:
+            logger.warning("settings restore failed: %s", exc)
+
+    def _ensure_ws_feed(self, exchange_name: str) -> None:
+        """Create and start the native WebSocket feed for an exchange once."""
+        if exchange_name in self.ws_feeds:
+            return
+        feed = ExchangeWebSocketFeed(
+            exchange=exchange_name,
+            on_tick=self._on_ws_tick,
+        )
+        feed.start()
+        self.ws_feeds[exchange_name] = feed
+        logger.info("WS feed started: %s", exchange_name)
+
+    def _on_ws_tick(self, exchange_name: str, raw_symbol: str, price: float, size: float) -> None:
+        """Map a raw WS symbol back to its ccxt symbol and aggregate into 1m/2m candles."""
+        for adapter in self.adapters.values():
+            if adapter.exchange_id.value != exchange_name:
+                continue
+            # find ccxt symbol for this raw symbol
+            mapped = self._symbol_map.get((exchange_name, raw_symbol))
+            if mapped:
+                self.candles.ensure_series(exchange_name, mapped, "1m")
+                self.candles.ensure_series(exchange_name, mapped, "2m")
+                # update_from_trade is async; schedule without blocking the WS loop
+                try:
+                    loop = asyncio.get_event_loop()
+                    asyncio.ensure_future(
+                        self.candles.update_from_trade(exchange_name, mapped, price, size)
+                    )
+                except RuntimeError:
+                    pass
+            break
+
+    _symbol_map: Dict[tuple, str] = {}
+
+    def _rebuild_symbol_map(self) -> None:
+        """Map raw exchange symbols (from WS) to ccxt symbols using loaded markets."""
+        m: Dict[tuple, str] = {}
+        for adapter in self.adapters.values():
+            ex = adapter.exchange_id.value
+            try:
+                markets = adapter.client.markets or {}
+            except Exception:
+                markets = {}
+            for sym, market in markets.items():
+                m[(ex, market.get("id"))] = sym
+        self._symbol_map = m
 
     async def load_user_exchanges(self, user_id: str) -> List[str]:
         """Load encrypted exchange configs for a user and create adapters."""
@@ -148,10 +212,16 @@ class TradingEngine:
                 if user_id not in self.missions:
                     self.missions[user_id] = MissionEngine(self.db, user_id, self.risk)
                 connected.append(cfg_id)
+                # native WS market data for this exchange (public channels, no keys)
+                self._ensure_ws_feed(adapter.exchange_id.value)
                 logger.info("Exchange connected: %s (%s) user=%s api=%s",
                             row["exchange"], row.get("product"), user_id, mask_secret(api_key))
             except Exception as exc:
                 logger.error("adapter init failed for config %s: %s", cfg_id, exc)
+        self._rebuild_symbol_map()
+        # if trading was active before a restart, honor it now that adapters exist
+        if self.state == TradingState.trading_active and connected and self._state_user_id == user_id:
+            logger.info("trading was ACTIVE before restart; engine resumed with loaded exchanges")
         return connected
 
     def _persist_state(self, user_id: str) -> None:
@@ -190,13 +260,26 @@ class TradingEngine:
         return total
 
     def _user_id_for_execution(self) -> Optional[str]:
-        """Best-effort user attribution for trade persistence: the user whose
-        state we last persisted/restored, else the single known recorder."""
         if self._state_user_id and self._state_user_id in self.recorders:
             return self._state_user_id
         if len(self.recorders) == 1:
             return next(iter(self.recorders))
         return None
+
+    async def refresh_equity(self) -> None:
+        """Fetch account equity from the first connected exchange so the
+        dashboard balance reflects the real account."""
+        for adapter in self.adapters.values():
+            try:
+                balance = await adapter.fetch_balance()
+                equity = balance["equity"]
+                if equity > 0:
+                    self.equity = equity
+                    self.risk.update_equity(equity)
+                break
+            except Exception as exc:
+                logger.warning("equity refresh failed: %s", exc)
+                break
 
     async def _run_loop(self) -> None:
         while self._running:
@@ -210,6 +293,8 @@ class TradingEngine:
                 for ex in self.executors.values():
                     await ex.manage()
                     await self._record_closed_trades(ex)
+                if self.adapters and (now - self._last_scan) % 30 < MANAGE_INTERVAL:
+                    await self.refresh_equity()
                 await asyncio.sleep(MANAGE_INTERVAL)
             except asyncio.CancelledError:
                 raise
@@ -218,8 +303,6 @@ class TradingEngine:
                 await asyncio.sleep(5)
 
     async def _record_closed_trades(self, ex: ExecutionEngine) -> None:
-        """Persist newly closed positions to the trades table so Performance
-        and Trade History pages show real execution data (never zeroed)."""
         user_id = self._user_id_for_execution()
         if user_id is None:
             return
@@ -243,6 +326,7 @@ class TradingEngine:
 
     async def _scan_all(self) -> None:
         all_results: List[Opportunity] = []
+        ws_symbols: Dict[str, List[str]] = {}
         for cfg_id, scanner in self.scanners.items():
             try:
                 results = await scanner.scan(
@@ -274,10 +358,18 @@ class TradingEngine:
                     )
                     if opp:
                         all_results.append(opp)
+                    # collect raw ids for the WS feed of this exchange
+                    ws_symbols.setdefault(adapter.exchange_id.value, []).append(r["symbol"])
             except Exception as exc:
                 logger.warning("scan failed for %s: %s", cfg_id, exc)
         all_results.sort(key=lambda o: o.score, reverse=True)
         self.opportunities = all_results[:20]
+        # keep native WS feeds subscribed to the current scan candidates
+        self._rebuild_symbol_map()
+        for exchange_name, symbols in ws_symbols.items():
+            feed = self.ws_feeds.get(exchange_name)
+            if feed is not None:
+                feed.set_symbols(symbols[:50])
 
     async def _maybe_enter(self) -> None:
         if not self.opportunities:
@@ -314,5 +406,5 @@ class TradingEngine:
             scannedSymbols=len(self.opportunities),
             openPositions=open_positions,
             tradingActive=self.state == TradingState.trading_active,
-            message="",
+            message=f"equity:{self.equity:.2f}" if self.equity > 0 else "",
         )

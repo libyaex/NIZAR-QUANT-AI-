@@ -3,18 +3,25 @@ import { useEffect, useState } from 'react';
 import { getSupabase, missingEnvVars, apiBasePath, apiFetch } from '../lib/api';
 import type { EngineStatus, TradingState } from '../types';
 
-const NAV = [
-  { to: '/', label: 'Dashboard' },
-  { to: '/scanner', label: 'Market Scanner' },
-  { to: '/analysis', label: 'Analysis' },
-  { to: '/trading', label: 'Trading Controls' },
+/** Primary tabs shown in the mobile bottom navigation bar. */
+const PRIMARY_NAV = [
+  { to: '/', label: 'Home' },
+  { to: '/scanner', label: 'Scanner' },
+  { to: '/trading', label: 'Trade' },
   { to: '/positions', label: 'Positions' },
+  { to: '/missions', label: 'Mission' },
+];
+
+/** Secondary screens reachable from the mobile "More" sheet. */
+const MORE_NAV = [
+  { to: '/analysis', label: 'Trading Analysis' },
   { to: '/history', label: 'Trade History' },
   { to: '/performance', label: 'Performance' },
-  { to: '/missions', label: 'Profit Mission' },
   { to: '/exchanges', label: 'Exchanges' },
-  { to: '/settings', label: 'Settings' },
+  { to: '/settings', label: 'Risk & Settings' },
 ];
+
+const ALL_NAV = [...PRIMARY_NAV, ...MORE_NAV];
 
 export function StateBadge({ state }: { state: TradingState }) {
   const map: Record<TradingState, { cls: string; text: string }> = {
@@ -78,9 +85,13 @@ export function useEngineStatus(intervalMs = 5000) {
   return status;
 }
 
+/** Mobile-first application shell: top brand bar, bottom tab navigation,
+ *  and a "More" sheet for secondary screens. A sidebar replaces them on
+ *  large desktop screens. */
 export default function Layout() {
   const navigate = useNavigate();
   const status = useEngineStatus(8000);
+  const [moreOpen, setMoreOpen] = useState(false);
 
   useEffect(() => {
     const client = getSupabase();
@@ -100,17 +111,67 @@ export default function Layout() {
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">NIZAR <span>QUANT AI</span></div>
-        {NAV.map((n) => (
+        {ALL_NAV.map((n) => (
           <NavLink key={n.to} to={n.to} className={({ isActive }) => `nav-link${isActive ? ' active' : ''}`}>
             {n.label}
           </NavLink>
         ))}
         <button className="nav-link" onClick={signOut} style={{ marginTop: 'auto' }}>Sign Out</button>
       </aside>
-      <main className="main">
-        <SetupBanner />
-        <Outlet context={{ status }} />
-      </main>
+
+      <div className="app-body">
+        <header className="mobile-top-bar">
+          <div className="brand">NIZAR <span>QUANT AI</span></div>
+          {status && <StateBadge state={status.state} />}
+        </header>
+
+        <main className="main">
+          <SetupBanner />
+          <Outlet context={{ status }} />
+        </main>
+
+        <nav className="bottom-nav">
+          {PRIMARY_NAV.map((n) => (
+            <NavLink
+              key={n.to}
+              to={n.to}
+              className={({ isActive }) => `bottom-link${isActive ? ' active' : ''}`}
+            >
+              {n.label}
+            </NavLink>
+          ))}
+          <button
+            className={`bottom-link${moreOpen ? ' active' : ''}`}
+            onClick={() => setMoreOpen(!moreOpen)}
+          >
+            More
+          </button>
+        </nav>
+
+        {moreOpen && (
+          <>
+            <div className="more-backdrop" onClick={() => setMoreOpen(false)} />
+            <div className="more-sheet">
+              {MORE_NAV.map((n) => (
+                <NavLink
+                  key={n.to}
+                  to={n.to}
+                  onClick={() => setMoreOpen(false)}
+                  className="more-link"
+                >
+                  {n.label}
+                </NavLink>
+              ))}
+              <button
+                className="more-link"
+                onClick={() => { setMoreOpen(false); signOut(); }}
+              >
+                Sign Out
+              </button>
+            </div>
+          </>
+        )}
+      </div>
     </div>
   );
 }
