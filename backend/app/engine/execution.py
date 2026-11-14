@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 from app.engine.risk import RiskManager
 from app.exchanges.adapter import ExchangeAdapter
-from app.models import Opportunity, OrderSide, PositionSnapshot, ProductType, TradingDecision
+from app.models import Opportunity, OrderSide, PositionSnapshot, TradingDecision
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,13 @@ class ManagedPosition:
     exchange_order_id: Optional[str] = None
     remaining_qty: float = 0.0
     closed: bool = False
+    last_price: float = 0.0
+    exit_reason: str = ""
+    estimated_fees: float = 0.0
+
+    @property
+    def filled_qty(self) -> float:
+        return self.remaining_qty or self.qty
 
 
 @dataclass
@@ -51,6 +58,7 @@ class ExecutionEngine:
     trailing_stop_pct: float = 0.25
     partial_tp_pct: float = 50.0
     positions: Dict[str, ManagedPosition] = field(default_factory=dict)
+    _closed_buffer: List[ManagedPosition] = field(default_factory=list)
     _pending_orders: set = field(default_factory=set)
     _last_price_cache: Dict[str, float] = field(default_factory=dict)
 
@@ -60,6 +68,13 @@ class ExecutionEngine:
     def exchange_name(self) -> str:
         eid = self.adapter.exchange_id
         return eid.value if hasattr(eid, "value") else str(eid)
+
+    def drain_closed(self) -> List[ManagedPosition]:
+        """Return and clear positions closed since the last drain so the
+        engine can persist them to the trades table exactly once."""
+        drained = self._closed_buffer
+        self._closed_buffer = []
+        return drained
 
     def _is_pending(self, symbol: str) -> bool:
         return symbol in self._pending_orders
@@ -88,6 +103,9 @@ class ExecutionEngine:
             gross = (pos.entry_price - price) * qty
         fees = (pos.entry_price + price) * qty * self.fee_pct / 100
         return gross - fees
+
+    def _estimated_fees(self, pos: ManagedPosition, price: float, qty: float) -> float:
+        return (pos.entry_price + price) * qty * self.fee_pct / 100
 
     def _confirmed_fill(self, order: Optional[Dict[str, Any]]) -> Optional[float]:
         if not order:
@@ -242,7 +260,9 @@ class ExecutionEngine:
                         pos.stop_loss = new_sl
 
         for pid in to_remove:
-            self.positions.pop(pid, None)
+            closed_pos = self.positions.pop(pid, None)
+            if closed_pos is not None:
+                self._closed_buffer.append(closed_pos)
 
     async def _close(self, pos: ManagedPosition, price: float, reason: str) -> None:
         qty = pos.remaining_qty or pos.qty
@@ -253,6 +273,9 @@ class ExecutionEngine:
         pnl = self._realized_pnl(pos, price, qty)
         pos.realized_pnl = pnl
         pos.closed = True
+        pos.last_price = price
+        pos.exit_reason = reason
+        pos.estimated_fees = self._estimated_fees(pos, price, qty)
         self.risk.record_trade_result(pnl)
         logger.info("CLOSE %s %s pnl=%.4f reason=%s", pos.symbol, pos.side.value, pnl, reason)
 
@@ -262,6 +285,8 @@ class ExecutionEngine:
             return
         pnl = self._realized_pnl(pos, price, qty)
         pos.realized_pnl += pnl
+        pos.estimated_fees += self._estimated_fees(pos, price, qty)
+        pos.last_price = price
         pos.remaining_qty = max(0.0, (pos.remaining_qty or pos.qty) - qty)
         pos.partial_filled = True
         self.risk.record_trade_result(pnl)
@@ -278,11 +303,13 @@ class ExecutionEngine:
                 closed += 1
             except Exception as exc:
                 logger.error("close_all %s failed: %s", pos.symbol, exc)
-            self.positions.pop(pos.position_id, None)
+            removed = self.positions.pop(pos.position_id, None)
+            if removed is not None:
+                self._closed_buffer.append(removed)
         return closed
 
     def snapshots(self) -> List[PositionSnapshot]:
-        out = []
+        out: List[PositionSnapshot] = []
         for pos in self.positions.values():
             if pos.closed:
                 continue
@@ -323,5 +350,9 @@ class ExecutionEngine:
             if pos.symbol not in remote_symbols:
                 self.risk.record_trade_result(pos.realized_pnl)
                 pos.closed = True
+                pos.exit_reason = "reconciled"
+                pos.last_price = self._last_price_cache.get(pos.symbol, pos.entry_price)
                 logger.info("RECONCILE: %s not on exchange, marking closed", pos.symbol)
-                self.positions.pop(pos.position_id, None)
+                removed = self.positions.pop(pos.position_id, None)
+                if removed is not None:
+                    self._closed_buffer.append(removed)

@@ -28,6 +28,7 @@ from app.models import (
     ScannerConfig,
     TradingState,
 )
+from app.services.trade_recorder import TradeRecorder
 from app.services.vault import CredentialVault, mask_secret
 
 logger = logging.getLogger(__name__)
@@ -50,15 +51,19 @@ class TradingEngine:
         self.adapters: Dict[str, ExchangeAdapter] = {}
         self.scanners: Dict[str, MarketScanner] = {}
         self.executors: Dict[str, ExecutionEngine] = {}
+        self.recorders: Dict[str, TradeRecorder] = {}
         self.missions: Dict[str, MissionEngine] = {}
         self.opportunities: List[Opportunity] = []
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._last_scan = 0.0
         self._vault: Optional[CredentialVault] = None
+        # user whose persisted trading state we restore on startup
+        self._state_user_id: Optional[str] = None
 
     async def start(self) -> asyncio.Task:
         self._running = True
+        await self._restore_state_on_startup()
         self._task = asyncio.create_task(self._run_loop())
         return self._task
 
@@ -72,9 +77,40 @@ class TradingEngine:
         if self._vault is None:
             self._vault = CredentialVault(self.settings.credential_encryption_key)
 
+    async def _restore_state_on_startup(self) -> None:
+        """Restore the persisted trading state (app_state table) after a
+        backend restart so a Railway redeploy never silently re-enables or
+        disables live trading."""
+        try:
+            resp = self.db.table("app_state").select("*").order("updated_at", desc=True).limit(1).execute()
+            rows = resp.data or []
+        except Exception as exc:
+            logger.warning("state restore failed: %s", exc)
+            return
+        if not rows:
+            return
+        row = rows[0]
+        try:
+            state_value = row.get("state")
+            if state_value:
+                self.state = TradingState(state_value)
+                if self.state == TradingState.trading_active:
+                    # Do NOT auto-open positions before exchanges are loaded;
+                    # entries require adapters, created on first API call.
+                    logger.info("restored trading state: %s (pending exchange load)", self.state.value)
+                else:
+                    logger.info("restored trading state: %s", self.state.value)
+            self._state_user_id = row.get("user_id")
+            if self._state_user_id:
+                self.recorders[self._state_user_id] = TradeRecorder(self.db, self._state_user_id)
+        except Exception as exc:
+            logger.warning("state restore parse failed: %s", exc)
+
     async def load_user_exchanges(self, user_id: str) -> List[str]:
         """Load encrypted exchange configs for a user and create adapters."""
         self._ensure_vault()
+        if user_id not in self.recorders:
+            self.recorders[user_id] = TradeRecorder(self.db, user_id)
         try:
             resp = self.db.table("exchange_configs").select("*").eq("user_id", user_id).execute()
             rows = resp.data or []
@@ -119,6 +155,7 @@ class TradingEngine:
         return connected
 
     def _persist_state(self, user_id: str) -> None:
+        self._state_user_id = user_id
         try:
             self.db.table("app_state").upsert({
                 "user_id": user_id,
@@ -152,6 +189,15 @@ class TradingEngine:
             total += await ex.close_all()
         return total
 
+    def _user_id_for_execution(self) -> Optional[str]:
+        """Best-effort user attribution for trade persistence: the user whose
+        state we last persisted/restored, else the single known recorder."""
+        if self._state_user_id and self._state_user_id in self.recorders:
+            return self._state_user_id
+        if len(self.recorders) == 1:
+            return next(iter(self.recorders))
+        return None
+
     async def _run_loop(self) -> None:
         while self._running:
             try:
@@ -159,16 +205,41 @@ class TradingEngine:
                 if now - self._last_scan >= SCAN_INTERVAL:
                     await self._scan_all()
                     self._last_scan = now
-                if self.state == TradingState.trading_active:
+                if self.state == TradingState.trading_active and self.adapters:
                     await self._maybe_enter()
                 for ex in self.executors.values():
                     await ex.manage()
+                    await self._record_closed_trades(ex)
                 await asyncio.sleep(MANAGE_INTERVAL)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.error("engine loop error: %s", exc)
                 await asyncio.sleep(5)
+
+    async def _record_closed_trades(self, ex: ExecutionEngine) -> None:
+        """Persist newly closed positions to the trades table so Performance
+        and Trade History pages show real execution data (never zeroed)."""
+        user_id = self._user_id_for_execution()
+        if user_id is None:
+            return
+        recorder = self.recorders[user_id]
+        for pos in ex.drain_closed():
+            recorder.record(
+                exchange=pos.exchange,
+                symbol=pos.symbol,
+                product=pos.product,
+                side=pos.side.value,
+                qty=pos.qty,
+                entry_price=pos.entry_price,
+                exit_price=pos.last_price,
+                realized_pnl=pos.realized_pnl,
+                fees=pos.estimated_fees,
+                notes=pos.exit_reason,
+            )
+            mission = self.missions.get(user_id)
+            if mission:
+                mission.on_trade_closed(pos.realized_pnl)
 
     async def _scan_all(self) -> None:
         all_results: List[Opportunity] = []
