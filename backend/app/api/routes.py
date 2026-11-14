@@ -1,7 +1,7 @@
 """Main API routes: engine, exchanges, scanner, positions, missions, performance."""
 import logging
-from datetime import datetime, timezone
-from typing import List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -27,9 +27,31 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-# ---------------------------------------------------------------------------
-# Health & status
-# ---------------------------------------------------------------------------
+def _mission_to_api(row: Dict) -> Dict:
+    starting = float(row.get("starting_capital", 0))
+    target = float(row.get("target_capital", 0))
+    realized = float(row.get("realized_profit", 0))
+    unrealized = float(row.get("unrealized_profit", 0))
+    current = starting + realized
+    span = target - starting
+    progress = 0.0 if span <= 0 else min(100.0, max(0.0, (current - starting) / span * 100))
+    status = row.get("status", "active")
+    return {
+        "id": row.get("id"),
+        "startingCapital": starting,
+        "currentCapital": round(current, 4),
+        "targetCapital": target,
+        "realizedProfit": round(realized, 4),
+        "unrealizedProfit": round(unrealized, 4),
+        "remaining": round(max(0.0, target - current), 4),
+        "progressPct": round(progress, 2),
+        "status": status,
+        "compounding": bool(row.get("compounding", True)),
+        "startedAt": row.get("started_at") or row.get("created_at"),
+        "completedAt": row.get("completed_at"),
+        "allowsNewTrades": status == "active" and current < target,
+    }
+
 
 @router.get("/health")
 async def health():
@@ -58,10 +80,6 @@ async def close_all(user: AuthUser = Depends(current_user)):
     closed = await engine.close_all_positions()
     return {"closed": closed}
 
-
-# ---------------------------------------------------------------------------
-# Exchange management
-# ---------------------------------------------------------------------------
 
 @router.get("/exchanges", response_model=List[ExchangeStatus])
 async def list_exchanges(user: AuthUser = Depends(current_user)):
@@ -110,7 +128,6 @@ async def connect_exchange(body: ExchangeConfigIn, user: AuthUser = Depends(curr
     }
     resp = db.table("exchange_configs").insert(row).execute()
     created = (resp.data or [])[0]
-    # validate connectivity now
     await engine.load_user_exchanges(user.id)
     adapter = engine.adapters.get(created["id"])
     return ExchangeStatus(
@@ -138,10 +155,6 @@ async def disconnect_exchange(cfg_id: str, user: AuthUser = Depends(current_user
     return {"removed": True}
 
 
-# ---------------------------------------------------------------------------
-# Scanner / opportunities
-# ---------------------------------------------------------------------------
-
 @router.get("/scanner")
 async def scanner(limit: int = 20, user: AuthUser = Depends(current_user)):
     engine = engine_runtime.engine
@@ -158,10 +171,6 @@ async def scanner_raw(user: AuthUser = Depends(current_user)):
     return {"results": out[:40]}
 
 
-# ---------------------------------------------------------------------------
-# Positions
-# ---------------------------------------------------------------------------
-
 @router.get("/positions", response_model=List[PositionSnapshot])
 async def positions(user: AuthUser = Depends(current_user)):
     engine = engine_runtime.engine
@@ -170,10 +179,6 @@ async def positions(user: AuthUser = Depends(current_user)):
         out.extend(ex.snapshots())
     return out
 
-
-# ---------------------------------------------------------------------------
-# Settings (risk & scanner)
-# ---------------------------------------------------------------------------
 
 @router.get("/settings/risk", response_model=RiskSettings)
 async def get_risk(user: AuthUser = Depends(current_user)):
@@ -207,18 +212,12 @@ async def put_scanner_cfg(body: ScannerConfig, user: AuthUser = Depends(current_
     return body
 
 
-# ---------------------------------------------------------------------------
-# Profit missions
-# ---------------------------------------------------------------------------
-
 @router.get("/missions")
 async def list_missions(user: AuthUser = Depends(current_user)):
-    engine = engine_runtime.engine
     db = get_supabase(get_settings())
     resp = db.table("profit_missions").select("*").eq("user_id", user.id).order("created_at", desc=True).execute()
     rows = resp.data or []
-    missions = [engine._mission_row_to_dict(r) for r in rows]
-    return {"missions": missions}
+    return {"missions": [_mission_to_api(r) for r in rows]}
 
 
 @router.post("/missions")
@@ -237,10 +236,7 @@ async def create_mission(body: MissionIn, user: AuthUser = Depends(current_user)
     }
     resp = db.table("profit_missions").insert(row).execute()
     created = (resp.data or [])[0]
-    engine = engine_runtime.engine
-    if user.id not in engine.missions:
-        engine.missions[user.id] = MissionEngine.__new__(MissionEngine)
-    return engine._mission_row_to_dict(created)
+    return _mission_to_api(created)
 
 
 @router.put("/missions/{mission_id}")
@@ -258,17 +254,13 @@ async def update_mission(mission_id: str, body: MissionUpdate, user: AuthUser = 
     db.table("profit_missions").update(updates).eq("id", mission_id).eq("user_id", user.id).execute()
     resp = db.table("profit_missions").select("*").eq("id", mission_id).execute()
     row = (resp.data or [])[0]
-    return engine_runtime.engine._mission_row_to_dict(row)
+    return _mission_to_api(row)
 
-
-# ---------------------------------------------------------------------------
-# Performance & history
-# ---------------------------------------------------------------------------
 
 @router.get("/performance", response_model=PerformanceOut)
 async def performance(user: AuthUser = Depends(current_user)):
     db = get_supabase(get_settings())
-    resp = db.table("trades").select("*").eq("user_id", user.id).order("closed_at", desc=False).execute()
+    resp = db.table("trades").select("*").eq("user_id", user.id).order("created_at", desc=False).execute()
     rows = [r for r in (resp.data or []) if r.get("status") == "closed"]
     return compute_performance(rows)
 
@@ -282,7 +274,6 @@ async def trades(limit: int = 100, user: AuthUser = Depends(current_user)):
 
 def compute_performance(rows: List[dict]) -> PerformanceOut:
     import numpy as np
-    from datetime import timedelta
     total = len(rows)
     wins = [r for r in rows if float(r.get("realized_pnl") or 0) > 0]
     losses = [r for r in rows if float(r.get("realized_pnl") or 0) <= 0]
@@ -290,13 +281,21 @@ def compute_performance(rows: List[dict]) -> PerformanceOut:
     fees = sum(float(r.get("fees") or 0) for r in rows)
     gross_win = sum(float(r.get("realized_pnl") or 0) for r in wins)
     gross_loss = abs(sum(float(r.get("realized_pnl") or 0) for r in losses))
-    equity_curve = float(np.cumsum([float(r.get("realized_pnl") or 0) for r in rows)[-1]) if rows else 0.0
-    curve = np.cumsum([float(r.get("realized_pnl") or 0) for r in rows])
+    curve = np.cumsum([float(r.get("realized_pnl") or 0) for r in rows]) if rows else np.array([0.0])
     peak = np.maximum.accumulate(curve) if len(curve) else np.array([0.0])
     dd = float((peak - curve).max()) if len(curve) else 0.0
     now = datetime.now(timezone.utc)
-    today_rows = [r for r in rows if r.get("closed_at") and r["closed_at"][:10] == now.strftime("%Y-%m-%d")]
-    week_rows = [r for r in rows if r.get("closed_at") and now - datetime.fromisoformat(r["closed_at"].replace("Z", "+00:00")) <= timedelta(days=7)]
+    today_rows = [r for r in rows if r.get("closed_at") and str(r["closed_at"])[:10] == now.strftime("%Y-%m-%d")]
+    week_rows = []
+    for r in rows:
+        if not r.get("closed_at"):
+            continue
+        try:
+            closed = datetime.fromisoformat(str(r["closed_at"]).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if now - closed <= timedelta(days=7):
+            week_rows.append(r)
     spot_rows = [r for r in rows if r.get("product") == "spot"]
     fut_rows = [r for r in rows if r.get("product") == "futures"]
 
@@ -319,7 +318,7 @@ def compute_performance(rows: List[dict]) -> PerformanceOut:
         totalFees=round(fees, 4),
         avgProfit=round(gross_win / len(wins), 4) if wins else 0.0,
         avgLoss=round(gross_loss / len(losses), 4) if losses else 0.0,
-        profitFactor=round(gross_win / gross_loss, 4) if gross_loss else (float("inf") if gross_win else 0.0),
+        profitFactor=round(gross_win / gross_loss, 4) if gross_loss else 0.0,
         maxDrawdown=round(dd, 4),
         todayPnl=round(sum(float(r.get("realized_pnl") or 0) for r in today_rows), 4),
         weekPnl=round(sum(float(r.get("realized_pnl") or 0) for r in week_rows), 4),
