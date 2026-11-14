@@ -3,17 +3,17 @@
 Runs continuously on Railway independent of frontend connections:
 market data ingestion, scanner, analysis, probability updates, decision
 evaluation. Opening real positions happens ONLY when trading is explicitly
-activated via state transitions (START/STOP/HALT) which are persisted.
+activated via persisted state transitions (START/STOP/HALT).
 """
 import asyncio
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from app.engine.candles import CandleManager
 from app.engine.decision import DecisionEngine
-from app.engine.execution import ExecutionEngine, ManagedPosition
+from app.engine.execution import ExecutionEngine
 from app.engine.mission import MissionEngine
 from app.engine.probability import ProbabilityEngine
 from app.engine.risk import RiskManager
@@ -21,14 +21,11 @@ from app.engine.scanner import MarketScanner
 from app.exchanges.adapter import ExchangeAdapter
 from app.models import (
     EngineStatusOut,
-    ExchangeConfigIn,
     ExchangeID,
     Opportunity,
-    PerformanceOut,
     ProductType,
     RiskSettings,
     ScannerConfig,
-    TradingDecision,
     TradingState,
 )
 from app.services.vault import CredentialVault, mask_secret
@@ -37,8 +34,6 @@ logger = logging.getLogger(__name__)
 
 SCAN_INTERVAL = 60
 MANAGE_INTERVAL = 5
-EVAL_INTERVAL = 15
-PERSIST_INTERVAL = 30
 
 
 class TradingEngine:
@@ -62,7 +57,6 @@ class TradingEngine:
         self._last_scan = 0.0
         self._vault: Optional[CredentialVault] = None
 
-    # ------------------------------------------------------------------
     async def start(self) -> asyncio.Task:
         self._running = True
         self._task = asyncio.create_task(self._run_loop())
@@ -74,8 +68,11 @@ class TradingEngine:
             await adapter.close()
         self.adapters.clear()
 
-    # ------------------------------------------------------------------
-    async def load_user_exchanges(self, user_id: str) -> List[Dict[str, Any]]:
+    def _ensure_vault(self) -> None:
+        if self._vault is None:
+            self._vault = CredentialVault(self.settings.credential_encryption_key)
+
+    async def load_user_exchanges(self, user_id: str) -> List[str]:
         """Load encrypted exchange configs for a user and create adapters."""
         self._ensure_vault()
         try:
@@ -116,17 +113,10 @@ class TradingEngine:
                     self.missions[user_id] = MissionEngine(self.db, user_id, self.risk)
                 connected.append(cfg_id)
                 logger.info("Exchange connected: %s (%s) user=%s api=%s",
-                            row["exchange"], row.get("product"), user_id,
-                            mask_secret(api_key))
+                            row["exchange"], row.get("product"), user_id, mask_secret(api_key))
             except Exception as exc:
                 logger.error("adapter init failed for config %s: %s", cfg_id, exc)
-        # persist engine state marker
-        self._persist_state(user_id)
         return connected
-
-    def _ensure_vault(self) -> None:
-        if self._vault is None:
-            self._vault = CredentialVault(self.settings.credential_encryption_key)
 
     def _persist_state(self, user_id: str) -> None:
         try:
@@ -139,21 +129,10 @@ class TradingEngine:
         except Exception as exc:
             logger.warning("persist state failed: %s", exc)
 
-    async def restore_state(self, user_id: str) -> TradingState:
-        try:
-            resp = self.db.table("app_state").select("*").eq("user_id", user_id).limit(1).execute()
-            rows = resp.data or []
-            if rows:
-                self.state = TradingState(rows[0].get("state", TradingState.trading_stopped.value))
-        except Exception as exc:
-            logger.warning("restore state failed: %s", exc)
-        return self.state
-
-    # ------------------------------------------------------------------
     async def set_trading(self, user_id: str, action: str) -> TradingState:
         if action == "start":
             if self.state != TradingState.trading_active:
-                self.risk.resume()  # allow restart; risk state re-evaluated on next trade
+                self.risk.resume()
                 self.state = TradingState.trading_active
                 logger.info("TRADING ACTIVATED user=%s", user_id)
         elif action == "stop":
@@ -173,7 +152,6 @@ class TradingEngine:
             total += await ex.close_all()
         return total
 
-    # ------------------------------------------------------------------
     async def _run_loop(self) -> None:
         while self._running:
             try:
@@ -202,7 +180,6 @@ class TradingEngine:
                 )
                 adapter = self.adapters[cfg_id]
                 for r in results[:10]:
-                    # seed candles for top candidates
                     for tf in ("1m", "3m", "5m", "15m"):
                         ohlcv = await adapter.fetch_ohlcv(r["symbol"], timeframe=tf, limit=200)
                         self.candles.seed_from_rest(adapter.exchange_id.value, r["symbol"], tf, ohlcv)
@@ -216,9 +193,12 @@ class TradingEngine:
                         symbol=r["symbol"],
                         product="futures",
                         dfs=dfs,
-                        book={"bid": book["bids"][0][0] if book["bids"] else None,
-                              "ask": book["asks"][0][0] if book["asks"] else None,
-                              "bids": book["bids"], "asks": book["asks"]},
+                        book={
+                            "bid": book["bids"][0][0] if book["bids"] else None,
+                            "ask": book["asks"][0][0] if book["asks"] else None,
+                            "bids": book["bids"],
+                            "asks": book["asks"],
+                        },
                         min_score_override=self.risk.settings.minOpportunityScore,
                     )
                     if opp:
@@ -231,12 +211,11 @@ class TradingEngine:
     async def _maybe_enter(self) -> None:
         if not self.opportunities:
             return
-        # gate: mission must allow new trades
-        for user_id, mission in self.missions.items():
+        for mission in self.missions.values():
+            await mission.load_active()
             if not mission.allows_new_trades():
                 return
         for opp in self.opportunities:
-            # find executor for this exchange
             for cfg_id, adapter in self.adapters.items():
                 if adapter.exchange_id.value != opp.exchange:
                     continue
@@ -247,23 +226,16 @@ class TradingEngine:
                     balance = await adapter.fetch_balance()
                     equity = balance["equity"]
                     self.risk.update_equity(equity)
-                    pos = await ex.try_enter(opp, equity)
-                    if pos:
-                        for mission in self.missions.values():
-                            mission.set_unrealized(pos.qty * pos.entry_price * 0)
+                    await ex.try_enter(opp, equity)
                     break
                 except Exception as exc:
                     logger.warning("entry attempt failed %s: %s", opp.symbol, exc)
                     continue
 
-    # ------------------------------------------------------------------
     def status(self) -> EngineStatusOut:
         connected = [a.exchange_id.value for a in self.adapters.values()]
         open_positions = sum(ex.open_position_count() for ex in self.executors.values())
-        if not connected:
-            eff_state = TradingState.engine_ready
-        else:
-            eff_state = self.state
+        eff_state = TradingState.engine_ready if not connected else self.state
         return EngineStatusOut(
             state=eff_state,
             uptimeSeconds=int(time.time() - self.started_at),
