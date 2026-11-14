@@ -2,12 +2,9 @@
 
 Each adapter wraps a ccxt exchange instance for REST functionality and
 exposes capability discovery (markets, precision, leverage limits, order
-types) so the trading engine never assumes features exist. WebSocket feeds
-use ccxt.pro-style watch methods when available, otherwise REST polling.
+types) so the trading engine never assumes features exist.
 """
-import asyncio
 import logging
-import time
 from typing import Any, Dict, List, Optional
 
 import ccxt.async_support as ccxt_async
@@ -16,12 +13,12 @@ from app.models import ExchangeID, ProductType
 
 logger = logging.getLogger(__name__)
 
-OPTIONS_BY_EXCHANGE: Dict[str, Dict[str, Any]] = {
-    "binance": {"options": {"defaultType": "future"}},
-    "mexc": {"options": {"defaultType": "swap"}},
-    "bybit": {"options": {"defaultType": "linear"}},
-    "okx": {"options": {"defaultType": "swap"}},
-    "bitget": {"options": {"defaultType": "linear"}},
+OPTIONS_BY_EXCHANGE: Dict[str, Any] = {
+    "binance": "future",
+    "mexc": "swap",
+    "bybit": "linear",
+    "okx": "swap",
+    "bitget": "linear",
 }
 
 
@@ -34,20 +31,17 @@ class ExchangeAdapter:
         self.exchange_id = exchange
         self.product = product
         self.testnet = testnet
-        cfg = OPTIONS_BY_EXCHANGE.get(exchange.value, {})
-        params: Dict[str, Any] = {
+        default_type = OPTIONS_BY_EXCHANGE.get(exchange.value, "swap")
+        if product == ProductType.spot:
+            default_type = "spot"
+        cls = getattr(ccxt_async, exchange.value)
+        self.client = cls({
             "apiKey": apiKey,
             "secret": secret,
+            "password": password,
             "enableRateLimit": True,
-            "options": dict(cfg.get("options", {})),
-        }
-        if password:
-            params["password"] = password
-        cls = getattr(ccxt_async, exchange.value)
-        self.client = cls(params) if False else cls({k: v for k, v in params.items() if k != "options"})
-        self.client.options.update(params["options"])
-        if product == ProductType.spot:
-            self.client.options["defaultType"] = "spot"
+            "options": {"defaultType": default_type},
+        })
         if testnet:
             self._set_testnet()
 
@@ -57,19 +51,17 @@ class ExchangeAdapter:
         except Exception as exc:  # not all exchanges support sandbox
             logger.warning("%s sandbox not available: %s", self.exchange_id, exc)
 
-    # -- capability discovery ------------------------------------------------
     async def load_capabilities(self) -> Dict[str, Any]:
         markets = await self.client.load_markets()
         tradable = [
             m for m in markets.values()
-            if (self.product == ProductType.futures and m.get("swap") or m.get("future"))
+            if (self.product == ProductType.futures and (m.get("swap") or m.get("future")))
             or (self.product == ProductType.spot and m.get("spot"))
         ]
         return {
             "markets": len(markets),
             "tradable": len(tradable),
             "symbols": [m["symbol"] for m in tradable],
-            "currencies": len(markets.values()),
         }
 
     async def fetch_ohlcv(self, symbol: str, timeframe: str = "1m", limit: int = 200) -> List[list]:
@@ -87,7 +79,6 @@ class ExchangeAdapter:
         info = bal.get("info", {})
         total = bal.get("total", {})
         usdt = float(total.get("USDT", 0) or 0)
-        # Futures margin balance fallbacks across exchanges
         if self.product == ProductType.futures and usdt == 0:
             for key in ("USDT", "usdt"):
                 data = info.get(key)
@@ -135,13 +126,10 @@ class ExchangeAdapter:
         return out
 
     async def close_position(self, symbol: str, side: str, amount: float) -> Optional[Dict[str, Any]]:
-        """Close by placing a reducing market order (hedge-safe)."""
+        """Close by placing a reducing market order."""
         close_side = "sell" if side == "long" else "buy"
-        params = {"reduceOnly": True}
-        if self.exchange_id == ExchangeID.okx:
-            params = {"reduceOnly": True}
         try:
-            return await self.client.create_order(symbol, "market", close_side, amount, None, params)
+            return await self.client.create_order(symbol, "market", close_side, amount, None, {"reduceOnly": True})
         except Exception as exc:
             logger.error("close_position %s %s failed: %s", self.exchange_id, symbol, exc)
             return None
