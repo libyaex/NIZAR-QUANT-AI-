@@ -6,9 +6,8 @@ configured exchange adapter. Dynamically lists available futures pairs.
 """
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-import numpy as np
 import pandas as pd
 
 from app.engine import analysis, microstructure
@@ -26,7 +25,6 @@ class MarketScanner:
         self._universe_cache: List[str] = []
         self._universe_ts: float = 0.0
 
-    # ------------------------------------------------------------------
     async def refresh_universe(self) -> List[str]:
         """Discover tradable futures symbols dynamically."""
         now = time.time()
@@ -34,14 +32,13 @@ class MarketScanner:
             return self._universe_cache
         try:
             caps = await self.adapter.load_capabilities()
-            symbols = [s for s in caps["symbols"] if s.endswith(":USDT") or "/USDT" in s]
+            symbols = [s for s in caps["symbols"] if ":USDT" in s or "/USDT" in s]
             self._universe_cache = symbols
             self._universe_ts = now
         except Exception as exc:
             logger.warning("universe refresh failed: %s", exc)
         return self._universe_cache
 
-    # ------------------------------------------------------------------
     async def prescreen(self, max_symbols: int) -> List[str]:
         """Rank by 24h volume from tickers, take top-N liquid candidates."""
         symbols = await self.refresh_universe()
@@ -64,10 +61,8 @@ class MarketScanner:
         rows.sort(key=lambda r: r[1], reverse=True)
         min_vol = float(self.config.get("minVolumeUsd", 5_000_000))
         max_spread = float(self.config.get("maxSpreadPct", 0.08))
-        out = [s for s, v, sp in rows if v >= min_vol and sp <= max_spread][:max_symbols]
-        return out
+        return [s for s, v, sp in rows if v >= min_vol and sp <= max_spread][:max_symbols]
 
-    # ------------------------------------------------------------------
     async def scan(self, max_symbols: int = 40, primary_tf: str = "1m") -> List[Dict[str, Any]]:
         """Full scan: prescreen then evaluate 1m behavior per candidate."""
         candidates = await self.prescreen(max_symbols)
@@ -77,8 +72,7 @@ class MarketScanner:
                 ohlcv = await self.adapter.fetch_ohlcv(sym, timeframe=primary_tf, limit=120)
                 if not ohlcv or len(ohlcv) < 30:
                     continue
-                df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
-                df = df.dropna().reset_index(drop=True)
+                df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"]).dropna().reset_index(drop=True)
                 price = float(df["close"].iloc[-1])
                 vol_usd = float(df["volume"].tail(20).sum() * price)
                 a = analysis.atr(df).iloc[-1]
@@ -93,12 +87,11 @@ class MarketScanner:
                 score = (
                     min(vol_usd / 1e8, 1.0) * 0.25
                     + min(atr_pct / 0.5, 1.0) * 0.25
-                    + max(0.0, min(sp["spread_pct"] / 0.05, 1.0)) * -0.2
+                    - min(sp["spread_pct"] / 0.05, 1.0) * 0.2
                     + min(rv, 3) / 3 * 0.2
                     + max(0.0, mom) * 0.15
                     + abs(acc) * 0.1
                 )
-                score = float(max(0.0, min(score, 1.0)))
                 results.append({
                     "symbol": sym,
                     "price": price,
@@ -108,7 +101,7 @@ class MarketScanner:
                     "relativeVolume": round(rv, 2),
                     "momentum": round(mom, 3),
                     "acceleration": round(acc, 4),
-                    "score": round(score, 3),
+                    "score": round(float(max(0.0, min(score, 1.0))), 3),
                 })
             except Exception as exc:
                 logger.debug("scan %s failed: %s", sym, exc)
@@ -118,7 +111,6 @@ class MarketScanner:
         self.last_scan = time.time()
         return results
 
-    # ------------------------------------------------------------------
     async def snapshot(self) -> List[Dict[str, Any]]:
         if not self.results or time.time() - self.last_scan > 60:
             await self.scan(
