@@ -20,13 +20,12 @@ class DecisionEngine:
         self.probability = probability
         self.min_score = min_score
 
-    # ------------------------------------------------------------------
     def evaluate(
         self,
         exchange: str,
         symbol: str,
         product: str,
-        dfs: Dict[str, "object"],
+        dfs: Dict[str, object],
         book: Optional[Dict] = None,
         taker_fee_pct: float = 0.05,
         min_score_override: Optional[float] = None,
@@ -39,18 +38,13 @@ class DecisionEngine:
         c = primary["close"]
         price = float(c.iloc[-1])
 
-        # --- component scores -------------------------------------------------
         candles = analysis.analyze_candlesticks(primary)
         struct = structure.analyze_structure(primary)
         br = structure.breakout_status(primary, struct["support"], struct["resistance"])
 
         ema9 = analysis.ema(c, 9)
         ema21 = analysis.ema(c, 21)
-        trend_bias = 0.0
-        if ema9.iloc[-1] > ema21.iloc[-1]:
-            trend_bias += 0.5
-        else:
-            trend_bias -= 0.5
+        trend_bias = 0.5 if ema9.iloc[-1] > ema21.iloc[-1] else -0.5
 
         r = analysis.rsi(c).iloc[-1]
         mh = analysis.macd_hist(c).iloc[-1]
@@ -71,45 +65,66 @@ class DecisionEngine:
         imbalance = 0.0
         spread_pct = 0.0
         if book is not None:
-            sp = microstructure.spread_metrics(book.get("bid", price * 0.999), book.get("ask", price * 1.001))
+            bid = book.get("bid") or (price * 0.999)
+            ask = book.get("ask") or (price * 1.001)
+            sp = microstructure.spread_metrics(bid, ask)
             spread_pct = sp["spread_pct"]
-            imbalance = microstructure.order_book_imbalance(
-                np.array(book.get("bids", []), dtype=float).reshape(-1, 2) if len(book.get("bids", [])) else np.zeros((1, 2)),
-                np.array(book.get("asks", []), dtype=float).reshape(-1, 2) if len(book.get("asks", [])) else np.zeros((1, 2)),
-            )
+            bids = np.array(book.get("bids", []), dtype=float)
+            asks = np.array(book.get("asks", []), dtype=float)
+            if bids.ndim == 2 and bids.shape[1] >= 2:
+                bids = bids[:, :2]
+            else:
+                bids = np.zeros((1, 2))
+            if asks.ndim == 2 and asks.shape[1] >= 2:
+                asks = asks[:, :2]
+            else:
+                asks = np.zeros((1, 2))
+            imbalance = microstructure.order_book_imbalance(bids, asks)
 
         prob = self.probability.predict(primary)
 
-        # --- multi-timeframe confirmation --------------------------------------
+        # multi-timeframe confirmation (3m / 5m / 15m)
         mtf_bias = 0.0
         for tf in ("3m", "5m", "15m"):
             dfc = dfs.get(tf)
             if dfc is None or len(dfc) < 30:
                 continue
             cc = dfc["close"]
-            e_fast = analysis.ema(cc, 9).iloc[-1]
-            e_slow = analysis.ema(cc, 21).iloc[-1]
-            mtf_bias += 0.25 if e_fast > e_slow else -0.25
+            mtf_bias += 0.25 if analysis.ema(cc, 9).iloc[-1] > analysis.ema(cc, 21).iloc[-1] else -0.25
 
-        # --- direction aggregation ---------------------------------------------
+        # direction aggregation
         bull = 0.0
         bear = 0.0
         bull += candles["bull_score"] * 0.08
         bear += candles["bear_score"] * 0.08
-        bull += max(struct.get("strength", 0), 0) * (0.4 if struct["bias"] == "bullish" else 0)
-        bear += max(struct.get("strength", 0), 0) * (0.4 if struct["bias"] == "bearish" else 0)
-        bull += trend_bias > 0 and 0.25 or 0.0
-        bear += trend_bias < 0 and 0.25 or 0.0
-        bull += (mtf_bias > 0) * min(abs(mtf_bias), 1) * 0.2
-        bear += (mtf_bias < 0) * min(abs(mtf_bias), 1) * 0.2
-        bull += np.clip((r - 50) / 50, -1, 1) * 0.15 if r > 55 else 0
-        bear += np.clip((50 - r) / 50, -1,  engine_placeholder := 1) * 0.15 if r < 45 else 0
-        bull += (mh > 0) * 0.15
-        bear += (mh < 0) * 0.15
-        bull += (srsi < 30) * 0.1
-        bear += (srsi > 70) * 0.1
-        bull += (bb_pos < 0.2) * 0.1
-        bear += (bb_pos > 0.8) * 0.1
+        if struct["bias"] == "bullish":
+            bull += struct.get("strength", 0) * 0.4
+        if struct["bias"] == "bearish":
+            bear += struct.get("strength", 0) * 0.4
+        if trend_bias > 0:
+            bull += 0.25
+        if trend_bias < 0:
+            bear += 0.25
+        if mtf_bias > 0:
+            bull += min(abs(mtf_bias), 1) * 0.2
+        if mtf_bias < 0:
+            bear += min(abs(mtf_bias), 1) * 0.2
+        if r > 55:
+            bull += float(np.clip((r - 50) / 50, -1, 1)) * 0.15
+        if r < 45:
+            bear += float(np.clip((50 - r) / 50, -1, 1)) * 0.15
+        if mh > 0:
+            bull += 0.15
+        if mh < 0:
+            bear += 0.15
+        if srsi < 30:
+            bull += 0.1
+        if srsi > 70:
+            bear += 0.1
+        if bb_pos < 0.2:
+            bull += 0.1
+        if bb_pos > 0.8:
+            bear += 0.1
         bull += max(mom, 0) * 0.25
         bear += max(-mom, 0) * 0.25
         bull += max(accel, 0) * 0.15
@@ -131,11 +146,12 @@ class DecisionEngine:
             bull += 0.2
 
         raw = bull - bear
+
         # liquidity and tradability gates
         if spread_pct > 0.08 or atr_pct < 0.05 or rel_vol < 0.6:
             return None
 
-        # expected move vs cost: round trip taker fees
+        # expected move vs round-trip taker cost
         cost_pct = taker_fee_pct * 2 + spread_pct
         exp_move = prob.get("expectedRangePct", 0.0) * 0.5
         if exp_move < cost_pct * 1.5:
