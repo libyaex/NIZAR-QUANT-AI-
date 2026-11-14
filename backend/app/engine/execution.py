@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 from app.engine.risk import RiskManager
 from app.exchanges.adapter import ExchangeAdapter
-from app.models import Opportunity, OrderSide, PositionSnapshot, ProductType, TradingDecision
+from app.models import Opportunity, OrderSide, PositionSnapshot, TradingDecision
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,6 @@ class ManagedPosition:
     exchange_order_id: Optional[str] = None
     remaining_qty: float = 0.0
     closed: bool = False
-    # Filled by _close()/reconcile() for persistence by the trading engine.
     last_price: float = 0.0
     exit_reason: str = ""
     estimated_fees: float = 0.0
@@ -97,9 +96,6 @@ class ExecutionEngine:
             return (price - pos.entry_price) / pos.entry_price * 100 * pos.leverage
         return (pos.entry_price - price) / pos.entry_price * 100 * pos.leverage
 
-    def _fees_for(self, price: float, qty: float) -> float:
-        return (self._last_price_cache.get("__entry_marker__", 0) or 0)  # placeholder removed below
-
     def _realized_pnl(self, pos: ManagedPosition, price: float, qty: float) -> float:
         if pos.side == OrderSide.long:
             gross = (price - pos.entry_price) * qty
@@ -109,8 +105,6 @@ class ExecutionEngine:
         return gross - fees
 
     def _estimated_fees(self, pos: ManagedPosition, price: float, qty: float) -> float:
-        if pos.side == OrderSide.long:
-            return (pos.entry_price + price) * qty * self.fee_pct / 100
         return (pos.entry_price + price) * qty * self.fee_pct / 100
 
     def _confirmed_fill(self, order: Optional[Dict[str, Any]]) -> Optional[float]:
