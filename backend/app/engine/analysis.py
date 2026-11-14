@@ -1,18 +1,9 @@
-"""Technical analysis engine.
-
-Candlestick patterns, market structure, and fast indicators. All functions
-operate on pandas DataFrames with columns: open, high, low, close, volume.
-Output dictionaries are plain primitives suitable for JSON responses.
-"""
-from typing import Dict, Optional
+"""Technical analysis engine: candlesticks, indicators, order-flow helpers."""
+from typing import Dict
 
 import numpy as np
 import pandas as pd
 
-
-# ---------------------------------------------------------------------------
-# Indicators (vectorized, no TA-Lib binary dependency required)
-# ---------------------------------------------------------------------------
 
 def ema(values: pd.Series, period: int) -> pd.Series:
     return values.ewm(span=period, adjust=False).mean()
@@ -63,16 +54,6 @@ def vwap(df: pd.DataFrame) -> float:
     return float((typical * vol).sum() / vol.sum()) if vol.notna().any() else float(df["close"].iloc[-1])
 
 
-def volume_sma_ratio(volumes: pd.Series, period: int = 20) -> float:
-    if len(volumes) < period + 1:
-        return 1.0
-    return float(volumes.iloc[-1] / max(volumes.iloc[-period:].mean(), 1e-12))
-
-
-# ---------------------------------------------------------------------------
-# Candlestick analysis
-# ---------------------------------------------------------------------------
-
 def analyze_candlesticks(df: pd.DataFrame) -> Dict:
     """Score recent candles: engulfing, pin bar, hammer/shooting star, doji,
     momentum candles, wick rejection, body strength, consecutive behavior."""
@@ -85,20 +66,14 @@ def analyze_candlesticks(df: pd.DataFrame) -> Dict:
     upper_wick = h - np.maximum(o, c)
     lower_wick = np.minimum(o, c) - l
     bull = (c > o).astype(float)
-    bull.iloc[:len(bull)] = bull  # keep dtype
-
     last = -1
     prev = -2
-
-    # Bullish / bearish engulfing
     if body.iloc[last] > body.iloc[prev] and c.iloc[last] > o.iloc[prev] and c.iloc[prev] < o.iloc[prev]:
         out["bull_score"] += 2.0
         out["reasons"].append("bullish_engulfing")
     if body.iloc[last] > body.iloc[prev] and c.iloc[last] < o.iloc[prev] and c.iloc[prev] > o.iloc[prev]:
         out["bear_score"] += 2.0
         out["reasons"].append("bearish_engulfing")
-
-    # Pin bar / hammer / shooting star (current candle only)
     if rng.iloc[last] > 0:
         if lower_wick.iloc[last] > 2 * body.iloc[last] and lower_wick.iloc[last] > 0.6 * rng.iloc[last]:
             out["bull_score"] += 1.5
@@ -106,14 +81,10 @@ def analyze_candlesticks(df: pd.DataFrame) -> Dict:
         if upper_wick.iloc[last] > 2 * body.iloc[last] and upper_wick.iloc[last] > 0.6 * rng.iloc[last]:
             out["bear_score"] += 1.5
             out["reasons"].append("shooting_star_pin_bar")
-
-    # Doji (indecision — reduce both)
     if body.iloc[last] < 0.1 * rng.iloc[last]:
         out["reasons"].append("doji")
         out["bull_score"] -= 0.5
         out["bear_score"] -= 0.5
-
-    # Momentum candle strength
     body_pct = float(body.iloc[last] / max(rng.iloc[last], 1e-12))
     if body_pct > 0.7:
         if c.iloc[last] > o.iloc[last]:
@@ -122,8 +93,6 @@ def analyze_candlesticks(df: pd.DataFrame) -> Dict:
         else:
             out["bear_score"] += 1.0
             out["reasons"].append("strong_bear_momentum")
-
-    # Consecutive behavior (last 3 candles)
     tail3 = bull.iloc[-3:]
     if tail3.sum() == 3:
         out["bull_score"] += 1.0
@@ -131,8 +100,6 @@ def analyze_candlesticks(df: pd.DataFrame) -> Dict:
     if tail3.sum() == 0:
         out["bear_score"] += 1.0
         out["reasons"].append("three_bears")
-
-    # Wick rejection of previous extremes
     if len(df) >= 10:
         if l.iloc[last] < df["low"].iloc[-10:-1].min() and c.iloc[last] > o.iloc[last]:
             out["bull_score"] += 1.5
@@ -140,19 +107,4 @@ def analyze_candlesticks(df: pd.DataFrame) -> Dict:
         if h.iloc[last] > df["high"].iloc[-10:-1].max() and c.iloc[last] < o.iloc[last]:
             out["bear_score"] += 1.5
             out["reasons"].append("liquidity_sweep_reversal")
-
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Market structure
-# ---------------------------------------------------------------------------
-
-def analyze_structure(df: pd.DataFrame, lookback: int = 60) -> Dict:
-    """HH/HL, LH/LL, break of structure, change of character, S/R levels."""
-    out: Dict = {"bias": "neutral", "strength": 0.0, "support": None, "resistance": None, "reasons": []}
-    if len(df) < 20:
-        return out
-    d = df.tail(lookback)
-    swing highs, _swing lows placeholder removed  # noqa
     return out
