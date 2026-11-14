@@ -53,6 +53,22 @@ def _mission_to_api(row: Dict) -> Dict:
     }
 
 
+def _settings_upsert(db, user_id: str, risk: Optional[dict] = None, scanner: Optional[dict] = None) -> None:
+    """Save settings so the engine restores them after a backend restart."""
+    try:
+        row = {
+            "user_id": user_id,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if risk is not None:
+            row["risk_settings"] = risk
+        if scanner is not None:
+            row["scanner_settings"] = scanner
+        db.table("user_settings").upsert(row).execute()
+    except Exception as exc:
+        logger.warning("settings persist failed: %s", exc)
+
+
 @router.get("/health")
 async def health():
     return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
@@ -60,7 +76,10 @@ async def health():
 
 @router.get("/status", response_model=EngineStatusOut)
 async def status(user: AuthUser = Depends(current_user)):
-    return engine_runtime.engine.status()
+    engine = engine_runtime.engine
+    if engine.adapters:
+        await engine.refresh_equity()
+    return engine.status()
 
 
 @router.post("/trading/ctl", response_model=EngineStatusOut)
@@ -71,6 +90,8 @@ async def trading_control(body: StartStopIn, user: AuthUser = Depends(current_us
     engine = engine_runtime.engine
     await engine.load_user_exchanges(user.id)
     await engine.set_trading(user.id, action)
+    if engine.adapters:
+        await engine.refresh_equity()
     return engine.status()
 
 
@@ -190,11 +211,7 @@ async def put_risk(body: RiskSettings, user: AuthUser = Depends(current_user)):
     engine = engine_runtime.engine
     engine.risk.settings_update(body)
     db = get_supabase(get_settings())
-    db.table("user_settings").upsert({
-        "user_id": user.id,
-        "risk_settings": body.model_dump(),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }).execute()
+    _settings_upsert(db, user.id, risk=body.model_dump())
     return body
 
 
@@ -209,6 +226,8 @@ async def put_scanner_cfg(body: ScannerConfig, user: AuthUser = Depends(current_
     engine.scanner_config = body
     for scanner in engine.scanners.values():
         scanner.config = body.model_dump()
+    db = get_supabase(get_settings())
+    _settings_upsert(db, user.id, scanner=body.model_dump())
     return body
 
 
@@ -276,7 +295,7 @@ def compute_performance(rows: List[dict]) -> PerformanceOut:
     import numpy as np
     total = len(rows)
     wins = [r for r in rows if float(r.get("realized_pnl") or 0) > 0]
-    losses = [r for r in rows if float(r.get("realized_pnl") or 0) <= 0]
+    losses = [r for r in rows if float(r.get("realized_pnl" or 0) or 0) <= 0]
     net = sum(float(r.get("realized_pnl") or 0) for r in rows)
     fees = sum(float(r.get("fees") or 0) for r in rows)
     gross_win = sum(float(r.get("realized_pnl") or 0) for r in wins)
