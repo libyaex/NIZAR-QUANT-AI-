@@ -1,87 +1,44 @@
-import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { getSupabase, missingEnvVars, apiBasePath } from '../lib/api';
-
-function SetupBanner() {
-  const missing = missingEnvVars();
-  const noApi = !apiBasePath();
-  if (missing.length === 0 && !noApi) return null;
-  return (
-    <div className="card" style={{ marginBottom: 16, borderColor: 'var(--red)', maxWidth: 420 }}>
-      <h3 style={{ color: 'var(--red)' }}>Configuration Required</h3>
-      <p style={{ fontSize: 13, lineHeight: 1.6 }}>
-        Missing environment variables (set them in Vercel, then redeploy):
-      </p>
-      <ul style={{ paddingLeft: 20, fontSize: 13, lineHeight: 1.8, color: 'var(--text-dim)' }}>
-        {missing.map((v) => <li key={v}><code>{v}</code></li>)}
-        {noApi && <li><code>VITE_API_URL</code></li>}
-      </ul>
-    </div>
-  );
-}
+import { FormEvent, useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { getSupabase } from '../lib/api';
+import { Banner, Field } from '../components/ui';
 
 export default function Auth() {
-  const navigate = useNavigate();
-  const [mode, setMode] = useState<'signin' | 'signup'>('signin');
+  const nav = useNavigate();
+  const sb = getSupabase();
+  const [mode, setMode] = useState<'in' | 'up'>('in');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [msg, setMsg] = useState<{ kind: 'err' | 'ok'; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
 
-  const client = getSupabase();
-
-  const submit = async (e: React.FormEvent) => {
+  const submit = async (e: FormEvent) => {
     e.preventDefault();
-    if (!client) {
-      setError('Cannot sign in: Supabase is not configured. Add the missing environment variables in Vercel and redeploy.');
-      return;
-    }
-    setBusy(true);
-    setError('');
-    try {
-      if (mode === 'signin') {
-        const { error } = await client.auth.signInWithPassword({ email, password });
-        if (error) throw error;
-      } else {
-        const { error } = await client.auth.signUp({ email, password });
-        if (error) throw error;
-      }
-      navigate('/');
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setBusy(false);
-    }
+    if (!sb) return;
+    setBusy(true); setMsg(null);
+    const res = mode === 'in' ? await sb.auth.signInWithPassword({ email, password }) : await sb.auth.signUp({ email, password });
+    setBusy(false);
+    if (res.error) return setMsg({ kind: 'err', text: res.error.message });
+    if (mode === 'up' && !res.data.session) return setMsg({ kind: 'ok', text: 'Account created. Check your email to confirm, then sign in.' });
+    nav('/');
   };
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', padding: 16 }}>
-      <SetupBanner />
-      <div className="card" style={{ width: 380, maxWidth: '100%' }}>
-        <div style={{ fontSize: 20, fontWeight: 700, marginBottom: 18 }}>
-          NIZAR <span style={{ color: 'var(--accent)' }}>QUANT AI</span>
-        </div>
-        <form onSubmit={submit}>
-          <div className="form-row">
-            <label>Email</label>
-            <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required />
-          </div>
-          <div className="form-row">
-            <label>Password</label>
-            <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required minLength={6} />
-          </div>
-          {error && <p style={{ color: 'var(--red)', fontSize: 13, marginBottom: 10 }}>{error}</p>}
-          <button className="btn primary" style={{ width: '100%' }} disabled={busy || !client}>
-            {mode === 'signin' ? 'Sign In' : 'Create Account'}
+    <div className="auth-wrap">
+      <div className="auth-card stack">
+        <div className="brand" style={{ justifyContent: 'center', fontSize: 20 }}><i>N</i>NIZAR <span>QUANT AI</span></div>
+        <form className="card stack" onSubmit={submit}>
+          <h2 style={{ fontSize: 20 }}>{mode === 'in' ? 'Sign in' : 'Create account'}</h2>
+          {!sb && <Banner kind="err">Supabase is not configured. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in Vercel and redeploy.</Banner>}
+          <Field label="Email"><input className="input" type="email" required autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} /></Field>
+          <Field label="Password"><input className="input" type="password" required minLength={6} autoComplete={mode === 'in' ? 'current-password' : 'new-password'} value={password} onChange={(e) => setPassword(e.target.value)} /></Field>
+          {msg && <Banner kind={msg.kind}>{msg.text}</Banner>}
+          <button className="btn primary block" disabled={busy || !sb}>{busy ? 'Please wait…' : mode === 'in' ? 'Sign in' : 'Create account'}</button>
+          <button type="button" className="btn ghost block" onClick={() => setMode(mode === 'in' ? 'up' : 'in')}>
+            {mode === 'in' ? 'New here? Create an account' : 'Have an account? Sign in'}
           </button>
         </form>
-        <button
-          className="nav-link"
-          style={{ marginTop: 12, textAlign: 'center', justifyContent: 'center' }}
-          onClick={() => setMode(mode === 'signin' ? 'signup' : 'signin')}
-        >
-          {mode === 'signin' ? "Don't have an account? Sign up" : 'Already have an account? Sign in'}
-        </button>
+        <Link to="/" className="muted small" style={{ textAlign: 'center' }}>Continue to live market view without signing in</Link>
       </div>
     </div>
   );

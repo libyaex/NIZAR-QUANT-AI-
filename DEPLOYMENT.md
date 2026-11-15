@@ -1,62 +1,35 @@
-# Deployment Guide
+# NIZAR QUANT AI — Deployment (v2)
 
-## 1. Environment variables
+## 1. Supabase
+Run `supabase/migrations/0001_init.sql` once in the SQL editor (creates tables + RLS; additive only).
+Rollback: `0001_rollback.sql`. v2 needs **no new SQL**.
+Auth → Providers → Email: enabled. (Disable "Confirm email" if you want instant sign-in.)
 
-### Railway (backend)
+## 2. Railway (backend)
+Root directory: `backend`. Start command comes from `railway.json` (health check `/api/health`).
 
-| Variable | Purpose |
+| Variable | Value |
 |---|---|
 | `SUPABASE_URL` | Supabase project URL |
-| `SUPABASE_SERVICE_ROLE_KEY` | Server-side DB access (never expose) |
-| `CREDENTIAL_ENCRYPTION_KEY` | Fernet key used to encrypt exchange secrets at rest |
-| `API_KEY_SECRET` | Secret for the backend API session token (any strong random string) |
-| `CORS_ORIGINS` | Comma-separated list of allowed frontend origins (Vercel domain) |
-| `PUBLIC_API_URL` | Optional, override public backend URL used in docs |
+| `SUPABASE_SERVICE_ROLE_KEY` | service-role key (server only) |
+| `CREDENTIAL_ENCRYPTION_KEY` | `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` — keep it forever, losing it makes saved API keys unreadable |
+| `API_KEY_SECRET` | any long random string |
+| `CORS_ORIGINS` | your Vercel URL, e.g. `https://nizar.vercel.app` (`*.vercel.app` is also allowed) |
+| `PUBLIC_EXCHANGES` | optional, default `okx,bitget,mexc,bybit,binance` |
 
-### Frontend (Vercel)
+**Region matters.** Binance and Bybit block US servers. In Railway → Service → Settings → Region choose **EU West (Amsterdam)**. The Exchange Management screen shows exactly which exchange is blocked.
+Keep the service at **1 replica** (the engine holds trading state in memory).
 
-| Variable | Purpose |
-|---|---|
-| `VITE_API_URL` | Backend base URL (Railway public URL, e.g. `https://<app>.up.railway.app`) |
+## 3. Vercel (frontend)
+Root directory: `frontend`, framework Vite. Variables:
+`VITE_API_URL` (Railway public URL), `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`
+(the Vercel×Supabase integration names `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY` are also read). Redeploy after changing variables.
 
-Supabase client keys (`VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`) are provided automatically by the Vercel–Supabase integration; they are only used for user login.
+## 4. First run
+1. Open the app: market data appears without logging in (Scanner, Analysis, charts).
+2. Sign up / sign in. 3. Risk & Settings: review defaults.
+4. Press START TRADING in **Paper** mode and watch it for a few days.
+5. Live: Exchange Management → connect keys (Read + Trade, **no withdrawals**, IP-restrict to Railway) → Trade screen → switch to Live → START.
 
-## 2. Supabase
-
-Apply `supabase/migrations/0001_init.sql` in the Supabase SQL editor (create tables + RLS policies).
-This migration only **creates new tables** — it does not modify or delete any existing data.
-Rollback: `supabase/migrations/0001_rollback.sql`.
-
-## 3. Railway
-
-- Root directory: `backend`
-- Start command: handled by `Procfile` (`uvicorn app.main:app`)
-- Add all backend environment variables above.
-
-## 4. Vercel
-
-- Root directory: `frontend`
-- Framework preset: Vite
-- Build command: `npm run build`
-- Add `VITE_API_URL`.
-
-## 5. Exchange API configuration
-
-In the app: **Exchange Management** screen → connect API keys.
-
-Create keys on each exchange with **trade permission enabled and withdrawal
-permission disabled**. Only the exchange-facing API is used; secrets are
-encrypted with `CREDENTIAL_ENCRYPTION_KEY` before storage and are never
-returned to the frontend.
-
-## 6. Activating automated trading
-
-1. Open the app, log in.
-2. Connect an exchange API key (Exchange Management).
-3. Configure risk settings and create a Profit Mission (optional).
-4. Press **START TRADING** on the dashboard.
-
-The background engine runs continuously on Railway; pressing START TRADING
-activates automated execution of real orders. Press **STOP TRADING** to stop
-opening new positions while continuing to manage existing ones.
-**CLOSE ALL POSITIONS** closes every open position immediately.
+## 5. Tests
+`cd backend && python -m pytest tests -q` (engine flow runs against a fake exchange, no network).

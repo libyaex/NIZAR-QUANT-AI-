@@ -1,27 +1,31 @@
-"""Risk management component.
+"""Risk management: the independent gatekeeper.
 
-Independent gatekeeper: position sizing from real equity and contract specs,
-daily loss limits, drawdown limits, consecutive-loss protection, leverage and
-concurrency caps. Attractive signals never override these restrictions.
+Position sizing from real equity, fees and contract specs; daily-loss,
+drawdown and consecutive-loss protection; leverage and concurrency caps.
+No signal, however attractive, can override these checks.
 """
 import logging
-import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 from app.models import RiskSettings
 
 logger = logging.getLogger(__name__)
 
+# Halts that only the user may clear (explicitly), vs. ones that clear by themselves.
+SELF_CLEARING = {"daily_loss_limit"}      # clears when the UTC day rolls over
+USER_CLEARABLE_ON_START = {"user_halt", "consecutive_losses"}
+
 
 @dataclass
 class RiskState:
-    day_start_ts: float = 0.0
+    day: str = ""
     day_start_equity: float = 0.0
     day_realized_pnl: float = 0.0
     peak_equity: float = 0.0
+    equity: float = 0.0
     consecutive_losses: int = 0
     halted: bool = False
     halt_reason: str = ""
@@ -31,42 +35,49 @@ class RiskManager:
     def __init__(self, settings: RiskSettings):
         self.settings = settings
         self.state = RiskState()
-        self._roll_day_if_needed(0.0)
 
-    def _now_utc_day(self) -> str:
+    @staticmethod
+    def _today() -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    def _roll_day_if_needed(self, equity: float) -> None:
-        today = self._now_utc_day()
-        if self.state.day_start_ts == 0.0 or time.strftime("%Y-%m-%d", time.gmtime(self.state.day_start_ts)) != today:
-            self.state.day_start_ts = time.time()
-            self.state.day_start_equity = equity
-            self.state.day_realized_pnl = 0.0
-        if equity > self.state.peak_equity:
-            self.state.peak_equity = equity
-
+    # ------------------------------------------------------------------ equity tracking
     def update_equity(self, equity: float) -> None:
-        self._roll_day_if_needed(equity)
+        if equity <= 0:
+            return
+        st = self.state
+        st.equity = equity
+        today = self._today()
+        if st.day != today:
+            st.day, st.day_start_equity, st.day_realized_pnl = today, equity, 0.0
+            if st.halt_reason in SELF_CLEARING:
+                st.halted, st.halt_reason = False, ""
+        if st.day_start_equity <= 0:
+            st.day_start_equity = equity
+        st.peak_equity = max(st.peak_equity, equity)
+        dd = (st.peak_equity - equity) / st.peak_equity * 100 if st.peak_equity else 0.0
+        if dd >= self.settings.maxDrawdownPct and not st.halted:
+            self._halt("max_drawdown")
+
+    def reset_baseline(self, equity: float) -> None:
+        """Call when the account changes (paper <-> live)."""
+        self.state = RiskState()
+        self.update_equity(equity)
 
     def record_trade_result(self, pnl: float) -> None:
-        self.state.day_realized_pnl += pnl
-        if pnl < 0:
-            self.state.consecutive_losses += 1
-        else:
-            self.state.consecutive_losses = 0
-        s = self.settings
-        base = self.state.day_start_equity or 1.0
-        if self.state.day_realized_pnl <= -base * s.maxDailyLossPct / 100:
-            self.state.halted = True
-            self.state.halt_reason = "daily_loss_limit"
-        if self.state.consecutive_losses >= s.consecutiveLossLimit:
-            self.state.halted = True
-            self.state.halt_reason = "consecutive_losses"
-        dd = (self.state.peak_equity - (base + self.state.day_realized_pnl)) / max(self.state.peak_equity, 1e-9)
-        if dd * 100 >= s.maxDrawdownPct:
-            self.state.halted = True
-            self.state.halt_reason = "max_drawdown"
+        st, s = self.state, self.settings
+        st.day_realized_pnl += pnl
+        st.consecutive_losses = st.consecutive_losses + 1 if pnl < 0 else 0
+        base = st.day_start_equity or st.equity or 1.0
+        if st.day_realized_pnl <= -base * s.maxDailyLossPct / 100:
+            self._halt("daily_loss_limit")
+        elif st.consecutive_losses >= s.consecutiveLossLimit:
+            self._halt("consecutive_losses")
 
+    def _halt(self, reason: str) -> None:
+        self.state.halted, self.state.halt_reason = True, reason
+        logger.warning("RISK HALT: %s", reason)
+
+    # ------------------------------------------------------------------ gates
     def can_open(self, open_positions: int) -> Tuple[bool, str]:
         if self.state.halted:
             return False, self.state.halt_reason
@@ -74,60 +85,44 @@ class RiskManager:
             return False, "max_positions"
         return True, ""
 
-    def position_size(
-        self,
-        equity: float,
-        price: float,
-        stop_loss_pct: float,
-        leverage_cap: int,
-        contract_min_amount: Optional[float],
-        amount_precision: Optional[float],
-        taker_fee_pct: float = 0.05,
-    ) -> Optional[float]:
-        """Risk-based sizing: risk budget = equity * riskPct; notional such that
-        stop distance * notional equals the risk budget. Clamped by leverage and
-        exchange minimums; rejects rather than exceeding risk."""
+    def trade_costs_ok(self, spread_pct: float) -> Tuple[bool, str]:
+        """Take-profit must clearly exceed round-trip costs."""
+        cost = 2 * self.settings.takerFeePct + spread_pct
+        if self.settings.takeProfitPct < cost * 1.5:
+            return False, "take_profit_below_costs"
+        return True, ""
+
+    def notional_for_risk(self, equity: float) -> float:
+        """Notional (USDT) such that hitting the stop loses riskPerTradePct of
+        equity including round-trip fees, capped by the leverage limit."""
         s = self.settings
-        if equity <= 0 or price <= 0 or stop_loss_pct <= 0:
-            return None
-        risk_budget = equity * s.riskPerTradePct / 100.0
-        loss_per_unit_notional = stop_loss_pct / 100.0 + 2 * taker_fee_pct / 100.0
-        notional = risk_budget / loss_per_unit_notional
-        max_notional = equity * min(leverage_cap, s.maxLeverage)
-        notional = min(notional, max_notional)
-        amount = notional / price
-        if contract_min_amount and amount < contract_min_amount:
-            return None
-        if amount_precision:
-            try:
-                step = float(amount_precision)
-                if step > 0:
-                    amount = math.floor(amount / step) * step
-            except (TypeError, ValueError):
-                pass
-        if amount <= 0:
-            return None
-        return float(amount)
+        if equity <= 0:
+            return 0.0
+        loss_per_notional = s.stopLossPct / 100 + 2 * s.takerFeePct / 100
+        return min(equity * s.riskPerTradePct / 100 / loss_per_notional, equity * s.maxLeverage)
 
     def stop_and_target_prices(self, side: str, entry: float) -> Dict[str, float]:
         s = self.settings
         if side == "long":
-            sl = entry * (1 - s.stopLossPct / 100)
-            tp = entry * (1 + s.takeProfitPct / 100)
-        else:
-            sl = entry * (1 + s.stopLossPct / 100)
-            tp = entry * (1 - s.takeProfitPct / 100)
-        return {"stop_loss": sl, "take_profit": tp}
+            return {"stop_loss": entry * (1 - s.stopLossPct / 100), "take_profit": entry * (1 + s.takeProfitPct / 100)}
+        return {"stop_loss": entry * (1 + s.stopLossPct / 100), "take_profit": entry * (1 - s.takeProfitPct / 100)}
 
+    # ------------------------------------------------------------------ controls
     def emergency_halt(self, reason: str) -> None:
-        self.state.halted = True
-        self.state.halt_reason = reason
-        logger.warning("EMERGENCY HALT: %s", reason)
+        self._halt(reason)
 
     def resume(self) -> None:
-        self.state.halted = False
-        self.state.halt_reason = ""
+        """Called on START TRADING. Clears only halts the user is allowed to
+        override; daily-loss and drawdown protections stay in force."""
+        if self.state.halt_reason in USER_CLEARABLE_ON_START:
+            self.state.halted, self.state.halt_reason = False, ""
+            self.state.consecutive_losses = 0
+
+    def reset(self) -> None:
+        """Explicit user action: clear every halt."""
+        self.state.halted, self.state.halt_reason = False, ""
         self.state.consecutive_losses = 0
+        self.state.peak_equity = self.state.equity
 
     def settings_update(self, s: RiskSettings) -> None:
         self.settings = s

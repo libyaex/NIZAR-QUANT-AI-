@@ -1,102 +1,81 @@
 import { useEffect, useState } from 'react';
-import { apiFetch } from '../lib/api';
+import { put, usePoll, useSession } from '../lib/api';
 import type { RiskSettings, ScannerConfig } from '../types';
+import { Banner, Card, Field, Skeleton } from '../components/ui';
+import { SignInCta } from '../components/shared';
 
-const RISK_FIELDS: Array<{ key: keyof RiskSettings; label: string; step: string }> = [
-  { key: 'riskPerTradePct', label: 'Risk per trade (%)', step: '0.1' },
-  { key: 'maxConcurrentPositions', label: 'Max simultaneous positions', step: '1' },
-  { key: 'maxDailyLossPct', label: 'Max daily loss (%)', step: '0.5' },
-  { key: 'maxDrawdownPct', label: 'Max drawdown (%)', step: '1' },
-  { key: 'maxLeverage', label: 'Max leverage (x)', step: '1' },
-  { key: 'stopLossPct', label: 'Stop-loss distance (%)', step: '0.05' },
-  { key: 'takeProfitPct', label: 'Take-profit target (%)', step: '0.05' },
-  { key: 'trailingStopPct', label: 'Trailing stop (%)', step: '0.05' },
-  { key: 'partialTakeProfitPct', label: 'Partial take-profit (%)', step: '5' },
-  { key: 'maxHoldingMinutes', label: 'Max holding (minutes)', step: '1' },
-  { key: 'consecutiveLossLimit', label: 'Consecutive loss limit', step: '1' },
-  { key: 'minOpportunityScore', label: 'Min opportunity score (0-1)', step: '0.05' },
+type RK = keyof RiskSettings;
+const RISK_FIELDS: { k: RK; label: string; hint: string; step?: number }[] = [
+  { k: 'riskPerTradePct', label: 'Risk per trade (%)', hint: 'Share of equity lost if the stop-loss is hit', step: 0.1 },
+  { k: 'maxConcurrentPositions', label: 'Max simultaneous positions', hint: 'Across all exchanges' },
+  { k: 'maxLeverage', label: 'Max leverage (x)', hint: 'Hard cap on notional / equity' },
+  { k: 'stopLossPct', label: 'Stop-loss distance (%)', hint: 'Price move against the trade', step: 0.05 },
+  { k: 'takeProfitPct', label: 'Take-profit target (%)', hint: 'Must exceed round-trip fees + spread', step: 0.05 },
+  { k: 'trailingStopPct', label: 'Trailing stop (%)', hint: 'Active after the partial take-profit', step: 0.05 },
+  { k: 'partialTakeProfitPct', label: 'Partial take-profit (% of position)', hint: '0 disables partial exits' },
+  { k: 'maxHoldingMinutes', label: 'Max holding time (min)', hint: 'Scalps are closed after this' },
+  { k: 'maxDailyLossPct', label: 'Max daily loss (%)', hint: 'Halts new trades for the UTC day', step: 0.5 },
+  { k: 'maxDrawdownPct', label: 'Max drawdown (%)', hint: 'From peak equity; halts until reset', step: 0.5 },
+  { k: 'consecutiveLossLimit', label: 'Consecutive-loss limit', hint: 'Pause after this many losses in a row' },
+  { k: 'minOpportunityScore', label: 'Min opportunity score (0–1)', hint: 'Lower = more trades, lower quality', step: 0.05 },
+  { k: 'takerFeePct', label: 'Taker fee per side (%)', hint: 'Used for sizing and cost checks', step: 0.01 },
+  { k: 'paperBalance', label: 'Paper account balance ($)', hint: 'Applies to Paper mode' },
+];
+const SCAN_FIELDS: { k: keyof ScannerConfig; label: string; hint: string; step?: number }[] = [
+  { k: 'maxSymbols', label: 'Symbols per exchange', hint: 'More = slower scans' },
+  { k: 'minVolumeUsd', label: 'Min 24h volume ($)', hint: 'Liquidity floor' },
+  { k: 'maxSpreadPct', label: 'Max spread (%)', hint: 'Rejects costly markets', step: 0.01 },
+  { k: 'minAtrPct', label: 'Min 1m volatility ATR (%)', hint: 'Rejects dead markets', step: 0.01 },
 ];
 
 export default function Settings() {
-  const [risk, setRisk] = useState<RiskSettings | null>(null);
-  const [scanner, setScanner] = useState<ScannerConfig | null>(null);
-  const [msg, setMsg] = useState('');
-
-  useEffect(() => {
-    const load = async () => {
-      try {
-        setRisk(await apiFetch<RiskSettings>('/api/settings/risk'));
-        setScanner(await apiFetch<ScannerConfig>('/api/settings/scanner'));
-      } catch { /* noop */ }
-    };
-    load();
-  }, []);
+  const { session } = useSession();
+  const risk = usePoll<RiskSettings>(session ? '/api/settings/risk' : null, 600000);
+  const scan = usePoll<ScannerConfig>(session ? '/api/settings/scanner' : null, 600000);
+  const [r, setR] = useState<RiskSettings | null>(null);
+  const [s, setS] = useState<ScannerConfig | null>(null);
+  const [msg, setMsg] = useState<{ kind: 'err' | 'ok'; text: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => { if (risk.data && !r) setR(risk.data); }, [risk.data, r]);
+  useEffect(() => { if (scan.data && !s) setS(scan.data); }, [scan.data, s]);
+  if (!session) return <div className="page"><SignInCta /></div>;
 
   const save = async () => {
-    if (!risk || !scanner) return;
-    setMsg('');
-    try {
-      await apiFetch('/api/settings/risk', { method: 'PUT', body: JSON.stringify(risk) });
-      await apiFetch('/api/settings/scanner', { method: 'PUT', body: JSON.stringify(scanner) });
-      setMsg('Saved.');
-    } catch (e) {
-      setMsg('Error: ' + (e as Error).message);
-    }
+    if (!r || !s) return;
+    setBusy(true); setMsg(null);
+    try { await put('/api/settings/risk', r); await put('/api/settings/scanner', s); setMsg({ kind: 'ok', text: 'Settings saved and applied to the running engine.' }); }
+    catch (e) { setMsg({ kind: 'err', text: (e as Error).message }); } finally { setBusy(false); }
   };
-
-  if (!risk || !scanner) return <div><h1 className="page-title">Settings</h1><p className="empty">Loading…</p></div>;
+  const num = (v: string) => (v === '' ? 0 : Number(v));
 
   return (
-    <div>
-      <h1 className="page-title">Risk Management & Settings</h1>
-      <div className="grid cols-2">
-        <div className="card">
-          <h3>Risk Management</h3>
-          {RISK_FIELDS.map((f) => (
-            <div className="form-row" key={f.key}>
-              <label>{f.label}</label>
-              <input
-                type="number" step={f.step}
-                value={String(risk[f.key])}
-                onChange={(e) => setRisk({ ...risk, [f.key]: Number(e.target.value) })}
-              />
+    <div className="page">
+      <div className="page-head"><div><h1>Risk & Settings</h1><p>The risk manager can never be overridden by a signal.</p></div>
+        <button className="btn primary" disabled={busy || !r} onClick={save}>{busy ? 'Saving…' : 'Save changes'}</button></div>
+      {msg && <Banner kind={msg.kind}>{msg.text}</Banner>}
+      {!r || !s ? <Skeleton h={300} /> : (
+        <>
+          <Card title="Risk management">
+            <div className="grid g2">
+              {RISK_FIELDS.map((f) => (
+                <Field key={f.k} label={f.label} hint={f.hint}>
+                  <input className="input" type="number" inputMode="decimal" step={f.step ?? 1} value={r[f.k] as number} onChange={(e) => setR({ ...r, [f.k]: num(e.target.value) })} />
+                </Field>
+              ))}
             </div>
-          ))}
-        </div>
-        <div className="card">
-          <h3>Scanner Configuration</h3>
-          <div className="form-row">
-            <label>Max scanned symbols</label>
-            <input type="number" value={scanner.maxSymbols}
-              onChange={(e) => setScanner({ ...scanner, maxSymbols: Number(e.target.value) })} />
-          </div>
-          <div className="form-row">
-            <label>Min 24h volume (USD)</label>
-            <input type="number" value={scanner.minVolumeUsd}
-              onChange={(e) => setScanner({ ...scanner, minVolumeUsd: Number(e.target.value) })} />
-          </div>
-          <div className="form-row">
-            <label>Max spread (%)</label>
-            <input type="number" step="0.01" value={scanner.maxSpreadPct}
-              onChange={(e) => setScanner({ ...scanner, maxSpreadPct: Number(e.target.value) })} />
-          </div>
-          <div className="form-row">
-            <label>Primary timeframe</label>
-            <select value={scanner.primaryTimeframe}
-              onChange={(e) => setScanner({ ...scanner, primaryTimeframe: e.target.value })}>
-              <option value="1m">1m (primary)</option>
-              <option value="2m">2m</option>
-            </select>
-          </div>
-          <div style={{ marginTop: 18 }}>
-            <button className="btn primary" onClick={save}>Save All Settings</button>
-            {msg && <p style={{ fontSize: 12, color: 'var(--text-dim)', marginTop: 8 }}>{msg}</p>}
-          </div>
-          <p style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 14 }}>
-            Risk limits are enforced server-side and cannot be overridden by signals.
-          </p>
-        </div>
-      </div>
+            <p className="tiny muted" style={{ marginTop: 12 }}>Execution mode ({r.tradingMode}) is switched on the Trade screen.</p>
+          </Card>
+          <Card title="Market scanner">
+            <div className="grid g2">
+              {SCAN_FIELDS.map((f) => (
+                <Field key={f.k} label={f.label} hint={f.hint}>
+                  <input className="input" type="number" inputMode="decimal" step={f.step ?? 1} value={s[f.k] as number} onChange={(e) => setS({ ...s, [f.k]: num(e.target.value) })} />
+                </Field>
+              ))}
+            </div>
+          </Card>
+        </>
+      )}
     </div>
   );
 }

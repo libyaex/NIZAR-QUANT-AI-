@@ -1,4 +1,5 @@
-"""FastAPI application entry point with background engine lifecycle."""
+"""FastAPI entry point. The trading engine starts with the process and keeps
+running regardless of whether any frontend is connected."""
 import logging
 from contextlib import asynccontextmanager
 
@@ -18,28 +19,30 @@ logger = logging.getLogger("nizar")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
-    db = get_supabase(settings)
-    engine = TradingEngine(db=db, settings=settings)
+    engine = TradingEngine(db=get_supabase(settings), settings=settings)
     engine_runtime.attach(engine)
-    task = await engine.start()
-    logger.info("Trading engine started (background market mode)")
+    await engine.start()
+    logger.info("Engine started: exchanges=%s mode=%s state=%s",
+                settings.market_exchanges, engine.mode.value, engine.state.value)
     try:
         yield
     finally:
         await engine.stop()
-        task.cancel()
-        logger.info("Trading engine stopped")
 
 
-app = FastAPI(title="NIZAR QUANT AI", version="1.0.0", lifespan=lifespan)
-
+app = FastAPI(title="NIZAR QUANT AI", version="2.0.0", lifespan=lifespan)
 settings = get_settings()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 app.include_router(api_router)
+
+
+@app.get("/")
+async def root():
+    return {"name": "NIZAR QUANT AI", "docs": "/docs", "health": "/api/health"}

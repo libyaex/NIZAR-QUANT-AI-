@@ -1,10 +1,10 @@
-"""Persistent background trading engine.
+"""Persistent trading engine.
 
-Runs continuously on Railway independent of frontend connections:
-market data ingestion (native exchange WebSockets + REST), scanner, analysis,
-probability updates, decision evaluation. Opening real positions happens
-ONLY when trading is explicitly activated via persisted state transitions
-(START/STOP/HALT).
+Runs 24/7 on Railway independent of any browser:
+  * MarketHub: key-less market data, scanner, analysis for every exchange.
+  * Execution: paper (simulated fills on real prices) or live (signed orders).
+Real positions are opened ONLY while trading is explicitly active
+(START / STOP / HALT are persisted, backend-controlled state transitions).
 """
 import asyncio
 import logging
@@ -12,399 +12,368 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from app.engine.candles import CandleManager
-from app.engine.decision import DecisionEngine
 from app.engine.execution import ExecutionEngine
+from app.engine.market_hub import MarketHub
 from app.engine.mission import MissionEngine
-from app.engine.probability import ProbabilityEngine
 from app.engine.risk import RiskManager
-from app.engine.scanner import MarketScanner
-from app.engine.websocket_feeds import ExchangeWebSocketFeed
-from app.exchanges.adapter import ExchangeAdapter
-from app.models import (
-    EngineStatusOut,
-    ExchangeID,
-    Opportunity,
-    ProductType,
-    RiskSettings,
-    ScannerConfig,
-    TradingState,
-)
+from app.exchanges.adapter import ExchangeAdapter, PaperAccount, PaperAdapter
+from app.models import (EngineStatusOut, ExchangeID, ProductType, RiskSettings, ScannerConfig,
+                        TradingMode, TradingState)
 from app.services.trade_recorder import TradeRecorder
 from app.services.vault import CredentialVault, mask_secret
 
 logger = logging.getLogger(__name__)
 
-SCAN_INTERVAL = 60
-MANAGE_INTERVAL = 5
+LOOP_INTERVAL = 5
+EQUITY_INTERVAL = 20
+RECONCILE_INTERVAL = 30
+MISSION_INTERVAL = 20
+MAX_ENTRIES_PER_CYCLE = 2
+MAX_SIGNAL_AGE_SEC = 120
 
 
 class TradingEngine:
     def __init__(self, db, settings):
         self.db = db
         self.settings = settings
-        self.candles = CandleManager()
-        self.probability = ProbabilityEngine()
-        self.decision = DecisionEngine(self.probability)
         self.risk = RiskManager(RiskSettings())
         self.scanner_config = ScannerConfig()
-        self.state = TradingState.trading_stopped
+        self.hub = MarketHub(settings.market_exchanges, settings.scan_interval_seconds,
+                             get_scanner=lambda: self.scanner_config, get_risk=lambda: self.risk.settings)
+        self.state = TradingState.engine_ready
         self.started_at = time.time()
-        self.adapters: Dict[str, ExchangeAdapter] = {}
-        self.scanners: Dict[str, MarketScanner] = {}
-        self.executors: Dict[str, ExecutionEngine] = {}
-        self.ws_feeds: Dict[str, ExchangeWebSocketFeed] = {}
+        self.owner_id: Optional[str] = None
+        self.paper = PaperAccount(self.risk.settings.paperBalance)
+        self.paper_executors: Dict[str, ExecutionEngine] = {}
+        self.live_adapters: Dict[str, ExchangeAdapter] = {}
+        self.live_executors: Dict[str, ExecutionEngine] = {}
+        self.live_status: Dict[str, Dict] = {}
         self.recorders: Dict[str, TradeRecorder] = {}
         self.missions: Dict[str, MissionEngine] = {}
-        self.opportunities: List[Opportunity] = []
-        self.equity: float = 0.0
+        self.equity = 0.0
+        self.equity_by_key: Dict[str, float] = {}
+        self._vault: Optional[CredentialVault] = None
         self._task: Optional[asyncio.Task] = None
         self._running = False
-        self._last_scan = 0.0
-        self._vault: Optional[CredentialVault] = None
-        self._state_user_id: Optional[str] = None
+        self._baseline_pending = True
 
+    # ------------------------------------------------------------------ lifecycle
     async def start(self) -> asyncio.Task:
         self._running = True
-        await self._restore_state_on_startup()
+        await self._restore()
+        await self.hub.start()
+        if self.owner_id:
+            await self.load_user_exchanges(self.owner_id)
         self._task = asyncio.create_task(self._run_loop())
         return self._task
 
     async def stop(self) -> None:
         self._running = False
-        for feed in self.ws_feeds.values():
-            await feed.stop()
-        self.ws_feeds.clear()
-        for adapter in self.adapters.values():
-            await adapter.close()
-        self.adapters.clear()
+        if self._task:
+            self._task.cancel()
+        await self.hub.stop()
+        for a in self.live_adapters.values():
+            await a.close()
 
-    def _ensure_vault(self) -> None:
+    def vault(self) -> CredentialVault:
         if self._vault is None:
             self._vault = CredentialVault(self.settings.credential_encryption_key)
+        return self._vault
 
-    async def _restore_state_on_startup(self) -> None:
-        """Restore persisted settings and trading state after a backend
-        restart so a Railway redeploy neither loses the user's risk/scanner
-        configuration nor silently re-enables live trading."""
+    async def _restore(self) -> None:
+        """Restore persisted trading state and settings after a restart."""
         try:
-            resp = self.db.table("app_state").select("*").order("updated_at", desc=True).limit(1).execute()
-            rows = resp.data or []
+            rows = self.db.table("app_state").select("*").order("updated_at", desc=True).limit(1).execute().data or []
         except Exception as exc:
             logger.warning("state restore failed: %s", exc)
             return
         if not rows:
             return
         row = rows[0]
+        self.owner_id = row.get("user_id")
         try:
-            state_value = row.get("state")
-            if state_value:
-                self.state = TradingState(state_value)
-                logger.info("restored trading state: %s", self.state.value)
-            self._state_user_id = row.get("user_id")
-            if self._state_user_id:
-                self.recorders[self._state_user_id] = TradeRecorder(self.db, self._state_user_id)
-        except Exception as exc:
-            logger.warning("state restore parse failed: %s", exc)
-        # restore saved risk + scanner settings (written by PUT /settings endpoints)
+            self.state = TradingState(row.get("state") or "engine_ready")
+        except ValueError:
+            self.state = TradingState.trading_stopped
+        if self.state == TradingState.emergency_halt:
+            self.risk.emergency_halt("user_halt")
+        logger.info("restored trading state=%s owner=%s", self.state.value, self.owner_id)
         try:
-            resp = self.db.table("user_settings").select("*").limit(1).execute()
-            rows = resp.data or []
-            if rows:
-                saved = rows[0]
-                risk_saved = saved.get("risk_settings") or {}
-                if risk_saved:
-                    self.risk.settings_update(RiskSettings(**risk_saved))
-                    logger.info("restored risk settings")
-                scanner_saved = saved.get("scanner_settings") or {}
-                if scanner_saved:
-                    self.scanner_config = ScannerConfig(**scanner_saved)
-                    logger.info("restored scanner settings")
+            q = self.db.table("user_settings").select("*").eq("user_id", self.owner_id).limit(1).execute()
+            saved = (q.data or [{}])[0]
+            if saved.get("risk_settings"):
+                self.risk.settings_update(RiskSettings(**saved["risk_settings"]))
+                self.paper.reset(self.risk.settings.paperBalance)
+            if saved.get("scanner_settings"):
+                self.scanner_config = ScannerConfig(**saved["scanner_settings"])
         except Exception as exc:
             logger.warning("settings restore failed: %s", exc)
 
-    def _ensure_ws_feed(self, exchange_name: str) -> None:
-        """Create and start the native WebSocket feed for an exchange once."""
-        if exchange_name in self.ws_feeds:
-            return
-        feed = ExchangeWebSocketFeed(
-            exchange=exchange_name,
-            on_tick=self._on_ws_tick,
-        )
-        feed.start()
-        self.ws_feeds[exchange_name] = feed
-        logger.info("WS feed started: %s", exchange_name)
+    # ------------------------------------------------------------------ executors
+    @property
+    def mode(self) -> TradingMode:
+        return self.risk.settings.tradingMode
 
-    def _on_ws_tick(self, exchange_name: str, raw_symbol: str, price: float, size: float) -> None:
-        """Map a raw WS symbol back to its ccxt symbol and aggregate into 1m/2m candles."""
-        for adapter in self.adapters.values():
-            if adapter.exchange_id.value != exchange_name:
-                continue
-            # find ccxt symbol for this raw symbol
-            mapped = self._symbol_map.get((exchange_name, raw_symbol))
-            if mapped:
-                self.candles.ensure_series(exchange_name, mapped, "1m")
-                self.candles.ensure_series(exchange_name, mapped, "2m")
-                # update_from_trade is async; schedule without blocking the WS loop
-                try:
-                    loop = asyncio.get_event_loop()
-                    asyncio.ensure_future(
-                        self.candles.update_from_trade(exchange_name, mapped, price, size)
-                    )
-                except RuntimeError:
-                    pass
-            break
+    def _ensure_paper_executors(self) -> None:
+        for name, st in self.hub.states.items():
+            if name not in self.paper_executors:
+                adapter = PaperAdapter(st.market, self.paper, self.risk.settings.takerFeePct)
+                self.paper_executors[name] = ExecutionEngine(adapter, self.risk, self.hub.latest)
 
-    _symbol_map: Dict[tuple, str] = {}
+    def executors(self) -> List[ExecutionEngine]:
+        """Executors that may OPEN trades in the current mode."""
+        if self.mode == TradingMode.live:
+            return list(self.live_executors.values())
+        self._ensure_paper_executors()
+        return list(self.paper_executors.values())
 
-    def _rebuild_symbol_map(self) -> None:
-        """Map raw exchange symbols (from WS) to ccxt symbols using loaded markets."""
-        m: Dict[tuple, str] = {}
-        for adapter in self.adapters.values():
-            ex = adapter.exchange_id.value
-            try:
-                markets = adapter.client.markets or {}
-            except Exception:
-                markets = {}
-            for sym, market in markets.items():
-                m[(ex, market.get("id"))] = sym
-        self._symbol_map = m
+    def all_executors(self) -> List[ExecutionEngine]:
+        """Every executor holding positions (managed regardless of mode)."""
+        return list(self.paper_executors.values()) + list(self.live_executors.values())
 
+    def open_total(self) -> int:
+        return sum(e.open_position_count() for e in self.all_executors())
+
+    def total_unrealized(self) -> float:
+        return sum(p.unrealizedPnl for e in self.all_executors() for p in e.snapshots())
+
+    def snapshots(self):
+        return [p for e in self.all_executors() for p in e.snapshots()]
+
+    # ------------------------------------------------------------------ live exchanges
     async def load_user_exchanges(self, user_id: str) -> List[str]:
-        """Load encrypted exchange configs for a user and create adapters."""
-        self._ensure_vault()
-        if user_id not in self.recorders:
-            self.recorders[user_id] = TradeRecorder(self.db, user_id)
+        """(Re)build signed adapters from the user's encrypted configs."""
+        self.recorders.setdefault(user_id, TradeRecorder(self.db, user_id))
+        self.missions.setdefault(user_id, MissionEngine(self.db, user_id))
         try:
-            resp = self.db.table("exchange_configs").select("*").eq("user_id", user_id).execute()
-            rows = resp.data or []
+            rows = self.db.table("exchange_configs").select("*").eq("user_id", user_id).execute().data or []
         except Exception as exc:
             logger.warning("load exchanges failed: %s", exc)
-            rows = []
+            return []
         connected: List[str] = []
         for row in rows:
             cfg_id = row["id"]
-            try:
-                api_key = self._vault.decrypt(row.get("api_key_enc", ""))
-                secret = self._vault.decrypt(row.get("secret_enc", ""))
-                password = self._vault.decrypt(row.get("password_enc", "")) if row.get("password_enc") else None
-                adapter = ExchangeAdapter(
-                    exchange=ExchangeID(row["exchange"]),
-                    product=ProductType(row.get("product", "futures")),
-                    apiKey=api_key,
-                    secret=secret,
-                    password=password,
-                    testnet=bool(row.get("testnet", False)),
-                )
-                ok = await adapter.ping()
-                if not ok:
-                    logger.warning("exchange %s ping failed for user %s", row["exchange"], user_id)
-                self.adapters[cfg_id] = adapter
-                self.scanners[cfg_id] = MarketScanner(adapter, self.scanner_config.model_dump())
-                self.executors[cfg_id] = ExecutionEngine(
-                    adapter=adapter,
-                    risk=self.risk,
-                    fee_pct=0.05,
-                    max_holding_minutes=self.risk.settings.maxHoldingMinutes,
-                    trailing_stop_pct=self.risk.settings.trailingStopPct,
-                    partial_tp_pct=self.risk.settings.partialTakeProfitPct,
-                )
-                if user_id not in self.missions:
-                    self.missions[user_id] = MissionEngine(self.db, user_id, self.risk)
+            if cfg_id in self.live_adapters:
                 connected.append(cfg_id)
-                # native WS market data for this exchange (public channels, no keys)
-                self._ensure_ws_feed(adapter.exchange_id.value)
-                logger.info("Exchange connected: %s (%s) user=%s api=%s",
-                            row["exchange"], row.get("product"), user_id, mask_secret(api_key))
-            except Exception as exc:
-                logger.error("adapter init failed for config %s: %s", cfg_id, exc)
-        self._rebuild_symbol_map()
-        # if trading was active before a restart, honor it now that adapters exist
-        if self.state == TradingState.trading_active and connected and self._state_user_id == user_id:
-            logger.info("trading was ACTIVE before restart; engine resumed with loaded exchanges")
+                continue
+            await self._connect_config(row)
+            if self.live_status.get(cfg_id, {}).get("connected"):
+                connected.append(cfg_id)
         return connected
 
-    def _persist_state(self, user_id: str) -> None:
-        self._state_user_id = user_id
+    async def _connect_config(self, row: Dict) -> None:
+        cfg_id = row["id"]
+        status = {"connected": False, "error": "", "equity": 0.0}
+        self.live_status[cfg_id] = status
+        try:
+            v = self.vault()
+            api_key = v.decrypt(row.get("api_key_enc", ""))
+            adapter = ExchangeAdapter(
+                exchange=ExchangeID(row["exchange"]), product=ProductType(row.get("product", "futures")),
+                apiKey=api_key, secret=v.decrypt(row.get("secret_enc", "")),
+                password=v.decrypt(row["password_enc"]) if row.get("password_enc") else None,
+                testnet=bool(row.get("testnet", False)))
+            await adapter.client.load_markets()
+            bal = await adapter.fetch_balance()     # proves the credentials work
+            status.update(connected=True, equity=bal["equity"])
+            self.live_adapters[cfg_id] = adapter
+            self.live_executors[cfg_id] = ExecutionEngine(adapter, self.risk, self.hub.latest)
+            logger.info("live exchange connected: %s key=%s equity=%.2f", row["exchange"], mask_secret(api_key), bal["equity"])
+        except Exception as exc:
+            status["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+            logger.error("exchange %s connect failed: %s", row.get("exchange"), status["error"])
+
+    async def remove_exchange(self, cfg_id: str) -> None:
+        ex = self.live_executors.pop(cfg_id, None)
+        if ex and ex.open_position_count():
+            self.live_executors[cfg_id] = ex
+            raise ValueError("Close this exchange's open positions before disconnecting it")
+        adapter = self.live_adapters.pop(cfg_id, None)
+        if adapter:
+            await adapter.close()
+        self.live_status.pop(cfg_id, None)
+
+    # ------------------------------------------------------------------ state machine
+    def _persist(self, user_id: str) -> None:
+        self.owner_id = user_id
         try:
             self.db.table("app_state").upsert({
-                "user_id": user_id,
-                "trading_active": self.state == TradingState.trading_active,
-                "state": self.state.value,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }).execute()
+                "user_id": user_id, "trading_active": self.state == TradingState.trading_active,
+                "state": self.state.value, "updated_at": datetime.now(timezone.utc).isoformat(),
+            }, on_conflict="user_id").execute()
         except Exception as exc:
             logger.warning("persist state failed: %s", exc)
 
     async def set_trading(self, user_id: str, action: str) -> TradingState:
         if action == "start":
-            if self.state != TradingState.trading_active:
-                self.risk.resume()
-                self.state = TradingState.trading_active
-                logger.info("TRADING ACTIVATED user=%s", user_id)
+            if self.mode == TradingMode.live:
+                await self.load_user_exchanges(user_id)
+                if not self.live_executors:
+                    raise ValueError("Live mode needs a connected exchange. Connect API keys or switch to Paper mode.")
+            self.risk.resume()
+            if self.risk.state.halted:
+                raise ValueError(f"Risk protection is active ({self.risk.state.halt_reason}). "
+                                 "New trades stay blocked until it clears or you reset risk.")
+            self.state = TradingState.trading_active
+            logger.info("TRADING ACTIVATED mode=%s user=%s", self.mode.value, user_id)
         elif action == "stop":
-            if self.state == TradingState.trading_active:
-                self.state = TradingState.trading_stopped
-                logger.info("TRADING STOPPED user=%s — managing existing positions", user_id)
+            self.state = TradingState.trading_stopped
+            logger.info("TRADING STOPPED user=%s (existing positions keep being managed)", user_id)
         elif action == "halt":
             self.state = TradingState.emergency_halt
             self.risk.emergency_halt("user_halt")
-            logger.warning("EMERGENCY HALT user=%s", user_id)
-        self._persist_state(user_id)
+        self._persist(user_id)
         return self.state
 
+    def reset_risk(self, user_id: str) -> None:
+        self.risk.reset()
+        if self.state == TradingState.emergency_halt:
+            self.state = TradingState.trading_stopped
+            self._persist(user_id)
+
     async def close_all_positions(self) -> int:
-        total = 0
-        for ex in self.executors.values():
-            total += await ex.close_all()
-        return total
+        return sum([await ex.close_all() for ex in self.all_executors()])
 
-    def _user_id_for_execution(self) -> Optional[str]:
-        if self._state_user_id and self._state_user_id in self.recorders:
-            return self._state_user_id
-        if len(self.recorders) == 1:
-            return next(iter(self.recorders))
-        return None
+    def apply_settings(self, user_id: str, risk: Optional[RiskSettings] = None,
+                       scanner: Optional[ScannerConfig] = None) -> None:
+        if risk is not None:
+            old = self.risk.settings
+            if risk.tradingMode != old.tradingMode:
+                if self.open_total():
+                    raise ValueError("Close all open positions before switching between Paper and Live mode")
+                if risk.tradingMode == TradingMode.live and not self.live_executors:
+                    raise ValueError("Connect an exchange (Exchange Management) before enabling Live mode")
+                if self.state == TradingState.trading_active:
+                    self.state = TradingState.trading_stopped      # never switch money mode silently
+                    self._persist(user_id)
+                self._baseline_pending = True
+            if risk.paperBalance != old.paperBalance and not self.paper.positions:
+                self.paper.reset(risk.paperBalance)
+                self._baseline_pending = True
+            self.risk.settings_update(risk)
+            for ex in self.paper_executors.values():
+                ex.adapter.fee_pct = risk.takerFeePct
+        if scanner is not None:
+            self.scanner_config = scanner
+        row = {"user_id": user_id, "updated_at": datetime.now(timezone.utc).isoformat()}
+        if risk is not None:
+            row["risk_settings"] = risk.model_dump(mode="json")
+        if scanner is not None:
+            row["scanner_settings"] = scanner.model_dump(mode="json")
+        try:
+            self.db.table("user_settings").upsert(row, on_conflict="user_id").execute()
+        except Exception as exc:
+            logger.warning("settings persist failed: %s", exc)
 
+    # ------------------------------------------------------------------ equity
     async def refresh_equity(self) -> None:
-        """Fetch account equity from the first connected exchange so the
-        dashboard balance reflects the real account."""
-        for adapter in self.adapters.values():
-            try:
-                balance = await adapter.fetch_balance()
-                equity = balance["equity"]
-                if equity > 0:
-                    self.equity = equity
-                    self.risk.update_equity(equity)
-                break
-            except Exception as exc:
-                logger.warning("equity refresh failed: %s", exc)
-                break
+        if self.mode == TradingMode.paper:
+            self.equity = self.paper.equity()
+            self.equity_by_key = {"paper": self.equity}
+        else:
+            total = 0.0
+            for cfg_id, adapter in self.live_adapters.items():
+                try:
+                    eq = (await adapter.fetch_balance())["equity"]
+                    self.equity_by_key[cfg_id] = eq
+                    self.live_status.setdefault(cfg_id, {})["equity"] = eq
+                    total += eq
+                except Exception as exc:
+                    self.live_status.setdefault(cfg_id, {})["error"] = str(exc)[:200]
+            self.equity = total
+        if self.equity > 0:
+            if self._baseline_pending:
+                self.risk.reset_baseline(self.equity)
+                self._baseline_pending = False
+            else:
+                self.risk.update_equity(self.equity)
 
+    # ------------------------------------------------------------------ main loop
     async def _run_loop(self) -> None:
+        nxt = {"equity": 0.0, "reconcile": 0.0, "mission": 0.0}
         while self._running:
             try:
                 now = time.time()
-                if now - self._last_scan >= SCAN_INTERVAL:
-                    await self._scan_all()
-                    self._last_scan = now
-                if self.state == TradingState.trading_active and self.adapters:
-                    await self._maybe_enter()
-                for ex in self.executors.values():
-                    await ex.manage()
-                    await self._record_closed_trades(ex)
-                if self.adapters and (now - self._last_scan) % 30 < MANAGE_INTERVAL:
+                if now >= nxt["equity"]:
+                    nxt["equity"] = now + EQUITY_INTERVAL
                     await self.refresh_equity()
-                await asyncio.sleep(MANAGE_INTERVAL)
+                if now >= nxt["mission"]:
+                    nxt["mission"] = now + MISSION_INTERVAL
+                    for m in self.missions.values():
+                        m.refresh()
+                if self.state == TradingState.trading_active:
+                    await self._maybe_enter()
+                for ex in self.all_executors():
+                    await ex.manage()
+                    self._record_closed(ex)
+                if now >= nxt["reconcile"]:
+                    nxt["reconcile"] = now + RECONCILE_INTERVAL
+                    for ex in self.live_executors.values():
+                        await ex.reconcile(adopt=True)
+                        self._record_closed(ex)
+                await asyncio.sleep(LOOP_INTERVAL)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                logger.error("engine loop error: %s", exc)
+            except Exception:
+                logger.exception("engine loop error")
                 await asyncio.sleep(5)
 
-    async def _record_closed_trades(self, ex: ExecutionEngine) -> None:
-        user_id = self._user_id_for_execution()
-        if user_id is None:
-            return
-        recorder = self.recorders[user_id]
+    def _record_closed(self, ex: ExecutionEngine) -> None:
         for pos in ex.drain_closed():
-            recorder.record(
-                exchange=pos.exchange,
-                symbol=pos.symbol,
-                product=pos.product,
-                side=pos.side.value,
-                qty=pos.qty,
-                entry_price=pos.entry_price,
-                exit_price=pos.last_price,
-                realized_pnl=pos.realized_pnl,
-                fees=pos.estimated_fees,
-                notes=pos.exit_reason,
-            )
-            mission = self.missions.get(user_id)
+            uid = self.owner_id
+            if uid is None or uid not in self.recorders:
+                continue
+            self.recorders[uid].record(
+                exchange=pos.exchange, symbol=pos.symbol, product=pos.product, side=pos.side.value,
+                qty=pos.qty, entry_price=pos.entry_price, exit_price=pos.last_price,
+                realized_pnl=pos.realized_pnl, fees=pos.fees, notes=f"{pos.mode}|{pos.exit_reason}")
+            mission = self.missions.get(uid)
             if mission:
                 mission.on_trade_closed(pos.realized_pnl)
 
-    async def _scan_all(self) -> None:
-        all_results: List[Opportunity] = []
-        ws_symbols: Dict[str, List[str]] = {}
-        for cfg_id, scanner in self.scanners.items():
-            try:
-                results = await scanner.scan(
-                    max_symbols=self.scanner_config.maxSymbols,
-                    primary_tf=self.scanner_config.primaryTimeframe,
-                )
-                adapter = self.adapters[cfg_id]
-                for r in results[:10]:
-                    for tf in ("1m", "3m", "5m", "15m"):
-                        ohlcv = await adapter.fetch_ohlcv(r["symbol"], timeframe=tf, limit=200)
-                        self.candles.seed_from_rest(adapter.exchange_id.value, r["symbol"], tf, ohlcv)
-                    dfs = {
-                        tf: self.candles.get_df(adapter.exchange_id.value, r["symbol"], tf)
-                        for tf in ("1m", "3m", "5m", "15m")
-                    }
-                    book = await adapter.fetch_order_book(r["symbol"], limit=20)
-                    opp = self.decision.evaluate(
-                        exchange=adapter.exchange_id.value,
-                        symbol=r["symbol"],
-                        product="futures",
-                        dfs=dfs,
-                        book={
-                            "bid": book["bids"][0][0] if book["bids"] else None,
-                            "ask": book["asks"][0][0] if book["asks"] else None,
-                            "bids": book["bids"],
-                            "asks": book["asks"],
-                        },
-                        min_score_override=self.risk.settings.minOpportunityScore,
-                    )
-                    if opp:
-                        all_results.append(opp)
-                    # collect raw ids for the WS feed of this exchange
-                    ws_symbols.setdefault(adapter.exchange_id.value, []).append(r["symbol"])
-            except Exception as exc:
-                logger.warning("scan failed for %s: %s", cfg_id, exc)
-        all_results.sort(key=lambda o: o.score, reverse=True)
-        self.opportunities = all_results[:20]
-        # keep native WS feeds subscribed to the current scan candidates
-        self._rebuild_symbol_map()
-        for exchange_name, symbols in ws_symbols.items():
-            feed = self.ws_feeds.get(exchange_name)
-            if feed is not None:
-                feed.set_symbols(symbols[:50])
-
     async def _maybe_enter(self) -> None:
-        if not self.opportunities:
+        if self.risk.state.halted:
             return
-        for mission in self.missions.values():
-            await mission.load_active()
-            if not mission.allows_new_trades():
+        mission = self.missions.get(self.owner_id or "")
+        if mission:
+            allowed, _ = mission.gate()
+            if not allowed:
                 return
-        for opp in self.opportunities:
-            for cfg_id, adapter in self.adapters.items():
-                if adapter.exchange_id.value != opp.exchange:
-                    continue
-                ex = self.executors.get(cfg_id)
-                if ex is None:
-                    continue
-                try:
-                    balance = await adapter.fetch_balance()
-                    equity = balance["equity"]
-                    self.risk.update_equity(equity)
-                    await ex.try_enter(opp, equity)
-                    break
-                except Exception as exc:
-                    logger.warning("entry attempt failed %s: %s", opp.symbol, exc)
-                    continue
+        execs = {ex.exchange_name: ex for ex in self.executors()}
+        if not execs:
+            return
+        now = datetime.now(timezone.utc)
+        entries = 0
+        for opp in self.hub.opportunities():
+            ex = execs.get(opp.exchange)
+            if ex is None or (now - opp.ts).total_seconds() > MAX_SIGNAL_AGE_SEC:
+                continue
+            if self.open_total() >= self.risk.settings.maxConcurrentPositions:
+                return
+            key = "paper" if self.mode == TradingMode.paper else next(
+                (k for k, v in self.live_executors.items() if v is ex), "")
+            equity = self.equity_by_key.get(key) or self.equity
+            if equity <= 0:
+                continue
+            if await ex.try_enter(opp, equity, self.open_total()):
+                entries += 1
+                if entries >= MAX_ENTRIES_PER_CYCLE:
+                    return
 
+    # ------------------------------------------------------------------ status
     def status(self) -> EngineStatusOut:
-        connected = [a.exchange_id.value for a in self.adapters.values()]
-        open_positions = sum(ex.open_position_count() for ex in self.executors.values())
-        eff_state = TradingState.engine_ready if not connected else self.state
+        hub_ok = [s["id"] for s in self.hub.status() if s["status"] == "ok"]
+        state = self.state
+        if not hub_ok and self.hub.states:
+            state = TradingState.connection_lost
+        elif self.state == TradingState.trading_active and self.risk.state.halted:
+            state = TradingState.emergency_halt
+        msg = ""
+        if self.mode == TradingMode.live and not self.live_executors:
+            msg = "Live mode selected but no exchange is connected"
         return EngineStatusOut(
-            state=eff_state,
-            uptimeSeconds=int(time.time() - self.started_at),
-            exchangesConnected=connected,
-            scannedSymbols=len(self.opportunities),
-            openPositions=open_positions,
-            tradingActive=self.state == TradingState.trading_active,
-            message=f"equity:{self.equity:.2f}" if self.equity > 0 else "",
-        )
+            state=state, uptimeSeconds=int(time.time() - self.started_at),
+            exchangesConnected=hub_ok, scannedSymbols=sum(s["scanned"] for s in self.hub.status()),
+            openPositions=self.open_total(), tradingActive=self.state == TradingState.trading_active,
+            mode=self.mode.value, equity=round(self.equity, 4),
+            haltReason=self.risk.state.halt_reason if self.risk.state.halted else "", message=msg)

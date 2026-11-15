@@ -89,17 +89,35 @@ class CandleManager:
                     series.last_update = time.time()
 
     def seed_from_rest(self, exchange: str, symbol: str, timeframe: str, ohlcv: List[list]) -> None:
-        key = (exchange, symbol, timeframe)
-        series = self.series.get(key)
-        if series is None:
-            series = CandleSeries(exchange=exchange, symbol=symbol, timeframe=timeframe)
-            self.series[key] = series
+        """Replace the series with a fresh REST snapshot (ordered, de-duplicated)."""
+        rows = {}
         for row in ohlcv:
-            if not row or len(row) < 6:
+            if row and len(row) >= 6 and row[4] is not None:
+                rows[int(row[0])] = Candle(ts=int(row[0]), open=float(row[1]), high=float(row[2]),
+                                           low=float(row[3]), close=float(row[4]), volume=float(row[5] or 0))
+        series = self.ensure_series(exchange, symbol, timeframe)
+        series.candles = [rows[k] for k in sorted(rows)][-series.max_candles:]
+        series.last_update = time.time()
+
+    def apply_tick(self, exchange: str, symbol: str, price: float, ts_ms: int) -> None:
+        """Synchronous tick update (event-loop single-threaded, so lock-free).
+        Only price is applied; tick sizes use exchange-specific units and would
+        corrupt the REST-derived volume."""
+        for tf, sec in self.tf_seconds.items():
+            series = self.series.get((exchange, symbol, tf))
+            if series is None or not series.candles:
                 continue
-            c = Candle(ts=int(row[0]), open=float(row[1]), high=float(row[2]),
-                       low=float(row[3]), close=float(row[4]), volume=float(row[5]))
-            series.upsert(c)
+            bucket = (ts_ms // (sec * 1000)) * sec * 1000
+            last = series.candles[-1]
+            if bucket > last.ts:
+                series.candles.append(Candle(ts=bucket, open=price, high=price, low=price, close=price, volume=0.0))
+                if len(series.candles) > series.max_candles:
+                    series.candles = series.candles[-series.max_candles:]
+            elif bucket == last.ts:
+                last.high = max(last.high, price)
+                last.low = min(last.low, price)
+                last.close = price
+            series.last_update = time.time()
 
     def get_df(self, exchange: str, symbol: str, timeframe: str) -> pd.DataFrame:
         series = self.series.get((exchange, symbol, timeframe))
@@ -118,3 +136,14 @@ class CandleManager:
     def stale_series(self, older_than_seconds: float = 120) -> List[Tuple[str, str, str]]:
         now = time.time()
         return [k for k, s in self.series.items() if now - s.last_update > older_than_seconds]
+
+def resample_ohlcv(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    """Aggregate 1m candles into N-minute candles (used for 2m/3m and as a
+    fallback when a confirmation timeframe was not fetched separately)."""
+    if df is None or df.empty or minutes <= 1:
+        return df
+    ms = minutes * 60_000
+    g = df.assign(bucket=(df["ts"] // ms) * ms).groupby("bucket", sort=True)
+    out = g.agg(open=("open", "first"), high=("high", "max"), low=("low", "min"),
+                close=("close", "last"), volume=("volume", "sum")).reset_index()
+    return out.rename(columns={"bucket": "ts"})

@@ -1,49 +1,48 @@
-import { useEffect, useState } from 'react';
-import { apiFetch } from '../lib/api';
-import type { Performance } from '../types';
+import { useState } from 'react';
+import { usePoll, useSession } from '../lib/api';
+import type { Performance as Perf } from '../types';
+import { Bars, Card, LineArea, Seg, Skeleton, Stat } from '../components/ui';
+import { SignInCta } from '../components/shared';
+import { money, signed, tone } from '../lib/format';
 
-function Stat({ label, value, cls }: { label: string; value: string; cls?: string }) {
+export default function Performance() {
+  const { session } = useSession();
+  const [mode, setMode] = useState<'paper' | 'live'>('paper');
+  const { data: p } = usePoll<Perf>(session ? `/api/performance?mode=${mode}` : null, 15000);
+  if (!session) return <div className="page"><SignInCta /></div>;
   return (
-    <div className="card">
-      <h3>{label}</h3>
-      <div className={`stat-value ${cls ?? ''}`}>{value}</div>
-    </div>
-  );
-}
-
-export default function PerformancePage() {
-  const [perf, setPerf] = useState<Performance | null>(null);
-
-  useEffect(() => {
-    const load = async () => {
-      try { setPerf(await apiFetch<Performance>('/api/performance')); } catch { /* noop */ }
-    };
-    load();
-    const id = setInterval(load, 15000);
-    return () => clearInterval(id);
-  }, []);
-
-  if (!perf) return <div><h1 className="page-title">Performance</h1><p className="empty">Loading…</p></div>;
-
-  const cls = (n: number) => (n >= 0 ? 'pos' : 'neg');
-
-  return (
-    <div>
-      <h1 className="page-title">Performance Analytics</h1>
-      <div className="grid cols-4">
-        <Stat label="Total Trades" value={String(perf.totalTrades)} />
-        <Stat label="Win Rate" value={perf.winRate.toFixed(2) + '%'} />
-        <Stat label="Net P&L" value={'$' + perf.netPnl.toFixed(2)} cls={cls(perf.netPnl)} />
-        <Stat label="Profit Factor" value={perf.profitFactor === Infinity ? 'INF' : perf.profitFactor.toFixed(2)} />
-        <Stat label="Avg Profit" value={'$' + perf.avgProfit.toFixed(4)} cls="pos" />
-        <Stat label="Avg Loss" value={'$' + perf.avgLoss.toFixed(4)} cls="neg" />
-        <Stat label="Max Drawdown" value={'$' + perf.maxDrawdown.toFixed(2)} cls="neg" />
-        <Stat label="Total Fees" value={'$' + perf.totalFees.toFixed(2)} />
-        <Stat label="Today P&L" value={'$' + perf.todayPnl.toFixed(2)} cls={cls(perf.todayPnl)} />
-        <Stat label="This Week P&L" value={'$' + perf.weekPnl.toFixed(2)} cls={cls(perf.weekPnl)} />
-        {perf.futures && <Stat label="Futures Trades" value={perf.futures.trades + ' · ' + perf.futures.winRate + '%'} />}
-        {perf.spot && <Stat label="Spot Trades" value={perf.spot.trades + ' · ' + perf.spot.winRate + '%'} />}
-      </div>
+    <div className="page">
+      <div className="page-head"><div><h1>Performance</h1><p>Computed from recorded trades only.</p></div>
+        <Seg value={mode} onChange={setMode} options={[{ v: 'paper', label: 'Paper' }, { v: 'live', label: 'Live' }]} /></div>
+      {!p ? <Skeleton h={260} /> : (
+        <>
+          <div className="grid g4">
+            <Stat label="Net realized P&L" value={signed(p.netPnl)} cls={tone(p.netPnl)} sub={`${p.totalTrades} trades`} />
+            <Stat label="Win rate" value={`${p.winRate.toFixed(1)}%`} sub={`${p.wins}W / ${p.losses}L`} />
+            <Stat label="Profit factor" value={p.profitFactor.toFixed(2)} sub={`avg win ${money(p.avgProfit, 3)} · avg loss ${money(p.avgLoss, 3)}`} />
+            <Stat label="Max drawdown" value={money(p.maxDrawdown)} sub={`fees paid ${money(p.totalFees, 3)}`} />
+          </div>
+          <Card title="Equity curve (cumulative realized P&L)"><LineArea points={p.curve.map((c) => c.pnl)} /></Card>
+          <div className="grid g2">
+            <Card title="Daily P&L (30 days)"><Bars items={p.daily.map((d) => ({ label: d.date, value: d.pnl }))} /></Card>
+            <Card title="Weekly P&L">
+              {p.weekly.length === 0 ? <div className="empty">No data yet</div> : (
+                <div className="list">{[...p.weekly].reverse().map((w) => <div key={w.week} className="item"><span className="muted">Week of {w.week}</span><b className={`mono ${tone(w.pnl)}`}>{signed(w.pnl)}</b></div>)}</div>
+              )}
+            </Card>
+          </div>
+          <div className="grid g3">
+            <Stat label="Today" value={signed(p.todayPnl)} cls={tone(p.todayPnl)} />
+            <Stat label="Last 7 days" value={signed(p.weekPnl)} cls={tone(p.weekPnl)} />
+            <Card title="By product">
+              <div className="stack small">
+                <div className="row"><span>Futures</span><span className="mono">{p.futures?.trades ?? 0} · {signed(p.futures?.netPnl ?? 0)} · {p.futures?.winRate ?? 0}%</span></div>
+                <div className="row"><span>Spot</span><span className="mono">{p.spot?.trades ?? 0} · {signed(p.spot?.netPnl ?? 0)} · {p.spot?.winRate ?? 0}%</span></div>
+              </div>
+            </Card>
+          </div>
+        </>
+      )}
     </div>
   );
 }

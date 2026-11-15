@@ -59,26 +59,34 @@ class ExchangeSecretOut(BaseModel):
     hasPassword: bool
 
 
+class TradingMode(str, Enum):
+    paper = "paper"
+    live = "live"
+
+
 class RiskSettings(BaseModel):
-    riskPerTradePct: float = 1.0
-    maxConcurrentPositions: int = 3
-    maxDailyLossPct: float = 5.0
-    maxDrawdownPct: float = 20.0
-    maxLeverage: int = 10
-    stopLossPct: float = 0.4
-    takeProfitPct: float = 0.8
-    trailingStopPct: float = 0.25
-    partialTakeProfitPct: float = 50.0
-    maxHoldingMinutes: int = 30
-    consecutiveLossLimit: int = 4
-    minOpportunityScore: float = 0.55
+    tradingMode: TradingMode = TradingMode.paper
+    paperBalance: float = Field(default=100.0, gt=0)
+    riskPerTradePct: float = Field(default=1.0, gt=0, le=10)
+    maxConcurrentPositions: int = Field(default=3, ge=1, le=20)
+    maxDailyLossPct: float = Field(default=5.0, gt=0, le=100)
+    maxDrawdownPct: float = Field(default=20.0, gt=0, le=100)
+    maxLeverage: int = Field(default=5, ge=1, le=125)
+    stopLossPct: float = Field(default=0.35, gt=0, le=20)
+    takeProfitPct: float = Field(default=0.6, gt=0, le=50)
+    trailingStopPct: float = Field(default=0.2, gt=0, le=20)
+    partialTakeProfitPct: float = Field(default=50.0, ge=0, le=100)
+    maxHoldingMinutes: int = Field(default=20, ge=1, le=1440)
+    consecutiveLossLimit: int = Field(default=4, ge=1, le=50)
+    minOpportunityScore: float = Field(default=0.5, ge=0.1, le=1.0)
+    takerFeePct: float = Field(default=0.05, ge=0, le=1)
 
 
 class ScannerConfig(BaseModel):
-    maxSymbols: int = 40
-    minVolumeUsd: float = 5_000_000
-    maxSpreadPct: float = 0.08
-    minAtrPct: float = 0.15
+    maxSymbols: int = Field(default=30, ge=5, le=100)
+    minVolumeUsd: float = Field(default=5_000_000, ge=0)
+    maxSpreadPct: float = Field(default=0.08, gt=0)
+    minAtrPct: float = Field(default=0.04, ge=0)
     primaryTimeframe: str = "1m"
     confirmationTimeframes: List[str] = Field(default_factory=lambda: ["3m", "5m", "15m"])
 
@@ -107,6 +115,12 @@ class Opportunity(BaseModel):
     product: str
     score: float
     decision: TradingDecision
+    price: float = 0.0
+    change24hPct: float = 0.0
+    momentum: float = 0.0
+    relativeVolume: float = 1.0
+    probSource: str = "heuristic_prior"
+    confidence: float = 0.0
     bullProb: float
     bearProb: float
     expectedRangePct: float
@@ -131,6 +145,8 @@ class PositionSnapshot(BaseModel):
     takeProfit: Optional[float] = None
     trailingActive: bool = False
     partialFilled: bool = False
+    protectedOnExchange: bool = False
+    mode: str = "paper"
     realizedPnl: float = 0.0
     unrealizedPnl: float = 0.0
     openedAt: datetime
@@ -144,6 +160,9 @@ class EngineStatusOut(BaseModel):
     scannedSymbols: int = 0
     openPositions: int = 0
     tradingActive: bool = False
+    mode: str = "paper"
+    equity: float = 0.0
+    haltReason: str = ""
     message: str = ""
 
 
@@ -183,3 +202,6 @@ class PerformanceOut(BaseModel):
     weekPnl: float
     spot: Optional[Dict[str, Any]] = None
     futures: Optional[Dict[str, Any]] = None
+    daily: List[Dict[str, Any]] = Field(default_factory=list)
+    weekly: List[Dict[str, Any]] = Field(default_factory=list)
+    curve: List[Dict[str, Any]] = Field(default_factory=list)

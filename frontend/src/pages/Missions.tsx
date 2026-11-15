@@ -1,138 +1,79 @@
-import { useEffect, useState } from 'react';
-import { apiFetch } from '../lib/api';
+import { useState } from 'react';
+import { put, post, usePoll, useSession } from '../lib/api';
 import type { Mission } from '../types';
+import { Banner, Card, Field, Pill, Ring, Skeleton } from '../components/ui';
+import { SignInCta } from '../components/shared';
+import { money, signed, tone, when } from '../lib/format';
 
-const PRESETS = [
-  { from: 1, to: 20 },
-  { from: 1, to: 100 },
-  { from: 5, to: 50 },
-  { from: 10, to: 100 },
-  { from: 50, to: 500 },
-  { from: 100, to: 1000 },
-];
+const PRESETS: [number, number][] = [[1, 20], [1, 100], [5, 50], [10, 100], [50, 500], [100, 1000]];
 
 export default function Missions() {
-  const [missions, setMissions] = useState<Mission[]>([]);
-  const [from, setFrom] = useState('');
-  const [to, setTo] = useState('');
-  const [compounding, setCompounding] = useState(true);
+  const { session } = useSession();
+  const { data, reload } = usePoll<{ missions: Mission[] }>(session ? '/api/missions' : null, 6000);
+  const [start, setStart] = useState('10');
+  const [target, setTarget] = useState('100');
+  const [compound, setCompound] = useState(true);
+  const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
+  if (!session) return <div className="page"><SignInCta /></div>;
 
-  const load = async () => {
-    try { setMissions((await apiFetch<{ missions: Mission[] }>('/api/missions')).missions); } catch { /* noop */ }
-  };
-
-  useEffect(() => { load(); }, []);
-
-  const create = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setBusy(true);
-    setError('');
-    try {
-      await apiFetch('/api/missions', {
-        method: 'POST',
-        body: JSON.stringify({ startingCapital: Number(from), targetCapital: Number(to), compounding }),
-      });
-      setFrom(''); setTo('');
-      await load();
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const update = async (id: string, status: string) => {
-    await apiFetch('/api/missions/' + id, { method: 'PUT', body: JSON.stringify({ status }) });
-    await load();
-  };
-
-  const active = missions.find((m) => m.status === 'active');
-  const fmt = (n: number) => '$' + n.toFixed(2);
-  const cls = (n: number) => (n >= 0 ? 'pos' : 'neg');
+  const [current, ...history] = data?.missions ?? [];
+  const run = async (fn: () => Promise<unknown>) => { setBusy(true); setErr(''); try { await fn(); await reload(); } catch (e) { setErr((e as Error).message); } finally { setBusy(false); } };
+  const create = () => run(() => post('/api/missions', { startingCapital: Number(start), targetCapital: Number(target), compounding: compound }));
+  const mult = Number(start) > 0 ? Number(target) / Number(start) : 0;
 
   return (
-    <div>
-      <h1 className="page-title">Profit Mission</h1>
-
-      {active && (
-        <div className="mission-hero" style={{ marginBottom: 16 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
-            <h3 style={{ margin: 0 }}>Active Mission</h3>
-            <button className="btn small" onClick={() => update(active.id, 'paused')}>Pause</button>
+    <div className="page">
+      <div className="page-head"><div><h1>Profit Mission</h1><p>A personal capital-growth goal. Examples only — results are never guaranteed.</p></div></div>
+      {err && <Banner kind="err">{err}</Banner>}
+      {!data ? <Skeleton h={240} /> : current && (
+        <Card className="hero">
+          {current.status === 'completed' && <Banner kind="ok"><div><b>Mission completed.</b> Target reached on {when(current.completedAt)}. New trades are paused — start a new mission below.</div></Banner>}
+          <div className="row" style={{ gap: 20, flexWrap: 'wrap', marginTop: current.status === 'completed' ? 12 : 0 }}>
+            <Ring pct={current.progressPct} size={170} stroke={14} label={`${current.progressPct.toFixed(1)}%`} sub="complete" />
+            <div style={{ flex: 1, minWidth: 220 }} className="stack">
+              <div className="row"><span className="muted small">Status</span><Pill tone={current.status === 'active' ? 'green' : current.status === 'paused' ? 'amber' : 'blue'} dot>{current.status}</Pill></div>
+              <div className="grid g2" style={{ gap: 10 }}>
+                <div className="stat"><div className="label">Starting</div><div className="value" style={{ fontSize: 18 }}>{money(current.startingCapital)}</div></div>
+                <div className="stat"><div className="label">Target</div><div className="value" style={{ fontSize: 18 }}>{money(current.targetCapital)}</div></div>
+                <div className="stat"><div className="label">Current capital</div><div className="value" style={{ fontSize: 18 }}>{money(current.currentCapital)}</div></div>
+                <div className="stat"><div className="label">Remaining</div><div className="value" style={{ fontSize: 18 }}>{money(current.remaining)}</div></div>
+                <div className="stat"><div className="label">Realized profit</div><div className={`value ${tone(current.realizedProfit)}`} style={{ fontSize: 18 }}>{signed(current.realizedProfit)}</div></div>
+                <div className="stat"><div className="label">Unrealized (open)</div><div className={`value ${tone(current.unrealizedProfit)}`} style={{ fontSize: 18 }}>{signed(current.unrealizedProfit)}</div></div>
+              </div>
+              <div className="tiny muted">Started {when(current.startedAt)} · compounding {current.compounding ? 'on' : 'off'}. Unrealized P&L is shown separately and never counts as progress until a trade closes.</div>
+              {current.status !== 'completed' && (
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  <button className="btn" disabled={busy} onClick={() => run(() => put(`/api/missions/${current.id}`, { status: current.status === 'active' ? 'paused' : 'active' }))}>{current.status === 'active' ? 'Pause mission' : 'Resume mission'}</button>
+                  <button className="btn ghost" disabled={busy} onClick={() => run(() => put(`/api/missions/${current.id}`, { compounding: !current.compounding }))}>Compounding: {current.compounding ? 'ON' : 'OFF'}</button>
+                </div>
+              )}
+            </div>
           </div>
-          <div className="amounts">
-            <div><div className="stat-value">{fmt(active.currentCapital)}</div><div className="stat-label">Current</div></div>
-            <div><div className="stat-value">{fmt(active.targetCapital)}</div><div className="stat-label">Target</div></div>
-            <div><div className={`stat-value ${cls(active.realizedProfit)}`}>{fmt(active.realizedProfit)}</div><div className="stat-label">Realized</div></div>
-            <div><div className={`stat-value ${cls(active.unrealizedProfit)}`}>{fmt(active.unrealizedProfit)}</div><div className="stat-label">Unrealized</div></div>
-            <div><div className="stat-value">{fmt(active.remaining)}</div><div className="stat-label">Remaining</div></div>
-          </div>
-          <div className="progress-wrap"><div className="progress-bar" style={{ width: active.progressPct + '%' }} /></div>
-          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: 'var(--text-dim)' }}>
-            <span>{active.progressPct.toFixed(1)}% complete</span>
-            <span>Compounding: {active.compounding ? 'ON' : 'OFF'}</span>
-          </div>
-        </div>
+        </Card>
       )}
 
-      <div className="grid cols-2">
-        <div className="card">
-          <h3>New Mission</h3>
-          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 14 }}>
-            {PRESETS.map((p) => (
-              <button key={p.from + '-' + p.to} className="btn small"
-                onClick={() => { setFrom(String(p.from)); setTo(String(p.to)); }}>
-                ${p.from} → ${p.to}
-              </button>
-            ))}
+      <Card title={current ? 'Start a new mission' : 'Create your first mission'}>
+        <div className="stack">
+          <div className="chips">{PRESETS.map(([a, b]) => <button key={a + '-' + b} className="chip" style={Number(start) === a && Number(target) === b ? { color: 'var(--text)', borderColor: 'var(--accent)' } : undefined} onClick={() => { setStart(String(a)); setTarget(String(b)); }}>${a} → ${b}</button>)}</div>
+          <div className="grid g2">
+            <Field label="Starting capital (USD)"><input className="input" inputMode="decimal" value={start} onChange={(e) => setStart(e.target.value)} /></Field>
+            <Field label="Target capital (USD)" hint={mult > 0 ? `${mult.toFixed(1)}x growth` : undefined}><input className="input" inputMode="decimal" value={target} onChange={(e) => setTarget(e.target.value)} /></Field>
           </div>
-          <form onSubmit={create}>
-            <div className="form-row">
-              <label>Starting Capital (USD)</label>
-              <input type="number" min="1" step="any" value={from} onChange={(e) => setFrom(e.target.value)} required />
-            </div>
-            <div className="form-row">
-              <label>Target Capital (USD)</label>
-              <input type="number" min="1" step="any" value={to} onChange={(e) => setTo(e.target.value)} required />
-            </div>
-            <div className="form-row">
-              <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <input type="checkbox" style={{ width: 'auto' }} checked={compounding} onChange={(e) => setCompounding(e.target.checked)} />
-                Automatic profit compounding
-              </label>
-            </div>
-            {error && <p style={{ color: 'var(--red)', fontSize: 13 }}>{error}</p>}
-            <button className="btn primary" disabled={busy}>Start Mission</button>
-            <p style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 10 }}>
-              Targets are personal goals, not guaranteed results. Position sizing always obeys risk limits.
-            </p>
-          </form>
+          <label className="row small" style={{ justifyContent: 'flex-start', gap: 10 }}><input type="checkbox" checked={compound} onChange={(e) => setCompound(e.target.checked)} />Automatic profit compounding</label>
+          {mult >= 10 && <Banner kind="warn">A {mult.toFixed(0)}x target is very aggressive. Position size never increases because a mission is progressing; it always follows your risk settings and exchange minimums, so large targets can take a long time or not be reached.</Banner>}
+          <button className="btn primary" disabled={busy || !(Number(start) > 0 && Number(target) > Number(start))} onClick={create}>{current ? 'Start new mission' : 'Create mission'}</button>
+          {current && current.status !== 'completed' && <div className="tiny muted">Starting a new mission pauses the current one.</div>}
         </div>
+      </Card>
 
-        <div className="card">
-          <h3>All Missions</h3>
-          {missions.length === 0 ? <p className="empty">No missions yet.</p> : (
-            <table>
-              <thead><tr><th>From → To</th><th>Progress</th><th>Status</th><th>Actions</th></tr></thead>
-              <tbody>
-                {missions.map((m) => (
-                  <tr key={m.id}>
-                    <td>{fmt(m.startingCapital)} → {fmt(m.targetCapital)}</td>
-                    <td>{m.progressPct.toFixed(1)}%</td>
-                    <td>{m.status}</td>
-                    <td>
-                      {m.status === 'paused' && <button className="btn small" onClick={() => update(m.id, 'active')}>Resume</button>}
-                      {m.status === 'active' && <button className="btn small" onClick={() => update(m.id, 'paused')}>Pause</button>}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </div>
-      </div>
+      {history.length > 0 && (
+        <Card title="Previous missions">
+          <div className="list">{history.map((m) => (
+            <div key={m.id} className="item"><div className="l"><b>{money(m.startingCapital)} → {money(m.targetCapital)}</b><div className="tiny muted">{when(m.startedAt)}</div></div>
+              <div className="r"><Pill tone={m.status === 'completed' ? 'blue' : 'gray'}>{m.status}</Pill><div className="tiny muted">{m.progressPct.toFixed(0)}%</div></div></div>))}</div>
+        </Card>
+      )}
     </div>
   );
 }

@@ -1,12 +1,12 @@
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import Layout from './components/Layout';
 import Auth from './pages/Auth';
 import Dashboard from './pages/Dashboard';
 import Scanner from './pages/Scanner';
 import Analysis from './pages/Analysis';
-import TradingControls from './pages/TradingControls';
+import Trading from './pages/Trading';
 import Positions from './pages/Positions';
-import TradeHistory from './pages/TradeHistory';
+import History from './pages/History';
 import Performance from './pages/Performance';
 import Missions from './pages/Missions';
 import Exchanges from './pages/Exchanges';
@@ -21,9 +21,9 @@ export default function App() {
           <Route path="/" element={<Dashboard />} />
           <Route path="/scanner" element={<Scanner />} />
           <Route path="/analysis" element={<Analysis />} />
-          <Route path="/trading" element={<TradingControls />} />
+          <Route path="/trading" element={<Trading />} />
           <Route path="/positions" element={<Positions />} />
-          <Route path="/history" element={<TradeHistory />} />
+          <Route path="/history" element={<History />} />
           <Route path="/performance" element={<Performance />} />
           <Route path="/missions" element={<Missions />} />
           <Route path="/exchanges" element={<Exchanges />} />

@@ -1,173 +1,103 @@
-import { useEffect, useState } from 'react';
-import { Link, useOutletContext } from 'react-router-dom';
-import { apiFetch } from '../lib/api';
-import { StateBadge } from '../components/Layout';
-import type { EngineStatus, Mission, Performance, Position } from '../types';
-
-type Ctx = { status: EngineStatus | null };
+import { useState } from 'react';
+import { Link } from 'react-router-dom';
+import { post, usePoll, useSession } from '../lib/api';
+import type { Dashboard as Dash, FeedStatus, Opportunity } from '../types';
+import { Banner, Card, ModePill, Ring, Skeleton, Stat, StateBadge } from '../components/ui';
+import { FeedStrip, OpportunityList, PositionList, SignInCta } from '../components/shared';
+import { money, signed, tone } from '../lib/format';
 
 export default function Dashboard() {
-  const { status } = useOutletContext<Ctx>();
-  const [positions, setPositions] = useState<Position[]>([]);
-  const [performance, setPerformance] = useState<Performance | null>(null);
-  const [mission, setMission] = useState<Mission | null>(null);
-  const [opportunities, setOpportunities] = useState<Array<{ symbol: string; decision: string; score: number }>>([]);
+  const { session } = useSession();
+  const dash = usePoll<Dash>(session ? '/api/dashboard' : null, 4000);
+  const market = usePoll<{ exchanges: FeedStatus[]; opportunities: Opportunity[]; scanned: number }>('/api/market?limit=5', 5000);
   const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
 
-  // Real account equity reported by the backend from the connected exchange.
-  const equityMatch = status?.message?.match(/equity:([\d.]+)/);
-  const equity = equityMatch ? Number(equityMatch[1]) : null;
-
-  const load = async () => {
-    try {
-      const [p, perf, missions, scan] = await Promise.all([
-        apiFetch<Position[]>('/api/positions'),
-        apiFetch<Performance>('/api/performance'),
-        apiFetch<{ missions: Mission[] }>('/api/missions'),
-        apiFetch<{ opportunities: Array<{ symbol: string; decision: string; score: number }> }>('/api/scanner?limit=3'),
-      ]);
-      setPositions(p);
-      setPerformance(perf);
-      setMission(missions.missions.find((m) => m.status === 'active') ?? missions.missions[0] ?? null);
-      setOpportunities(scan.opportunities);
-    } catch {
-      /* backend may be reconnecting */
-    }
-  };
-
-  useEffect(() => {
-    load();
-    const id = setInterval(load, 10000);
-    return () => clearInterval(id);
-  }, []);
-
+  const d = dash.data;
+  const active = d?.status.tradingActive ?? false;
   const control = async (action: 'start' | 'stop') => {
-    setBusy(true);
-    try {
-      await apiFetch('/api/trading/ctl', { method: 'POST', body: JSON.stringify({ action }) });
-      await load();
-    } finally {
-      setBusy(false);
-    }
+    setBusy(true); setErr('');
+    try { await post('/api/trading/ctl', { action }); await dash.reload(); }
+    catch (e) { setErr((e as Error).message); }
+    finally { setBusy(false); }
   };
-
-  const fmt = (n: number) => n.toFixed(2);
-  const pnlCls = (n: number) => (n >= 0 ? 'pos' : 'neg');
+  const closeAll = async () => {
+    if (!confirm('Close ALL open positions at market price?')) return;
+    setBusy(true);
+    try { await post('/api/trading/close-all'); await dash.reload(); } catch (e) { setErr((e as Error).message); } finally { setBusy(false); }
+  };
+  const m = d?.mission;
+  const opps = d?.opportunities ?? market.data?.opportunities ?? [];
 
   return (
-    <div>
-      <div className="mobile-only" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12, marginBottom: 16 }}>
-        <h1 className="page-title" style={{ marginBottom: 0 }}>Dashboard</h1>
-        {status && <StateBadge state={status.state} />}
-      </div>
+    <div className="page">
+      {!session && <SignInCta />}
+      {err && <Banner kind="err">{err}</Banner>}
+      {d?.status.haltReason && <Banner kind="warn"><div><b>Risk protection active:</b> {d.status.haltReason.replace(/_/g, ' ')}. New trades are blocked. <Link to="/trading" style={{ textDecoration: 'underline' }}>Review</Link></div></Banner>}
 
-      <div className="grid cols-4" style={{ marginBottom: 12 }}>
-        <div className="card">
-          <h3>Account Balance</h3>
-          <div className="stat-value">{equity !== null ? `$${fmt(equity)}` : '—'}</div>
-          <div className="stat-label">From exchange</div>
-        </div>
-        <div className="card">
-          <h3>Today P&L</h3>
-          <div className={`stat-value ${pnlCls(performance?.todayPnl ?? 0)}`}>
-            ${fmt(performance?.todayPnl ?? 0)}
+      {session && (
+        <Card className="hero">
+          <div className="row" style={{ marginBottom: 6 }}>
+            <span className="muted small">Account balance</span>
+            {d && <span style={{ display: 'flex', gap: 6 }}><ModePill mode={d.status.mode} /><StateBadge state={d.status.state} /></span>}
           </div>
-          <div className="stat-label">Realized today</div>
-        </div>
-        <div className="card">
-          <h3>Open Positions</h3>
-          <div className="stat-value">{positions.length}</div>
-          <div className="stat-label">Managed automatically</div>
-        </div>
-        <div className="card">
-          <h3>Win Rate</h3>
-          <div className="stat-value">{performance ? `${fmt(performance.winRate)}%` : '—'}</div>
-          <div className="stat-label">{performance ? `${performance.totalTrades} trades` : 'No trades yet'}</div>
-        </div>
-      </div>
+          {d ? (
+            <>
+              <div className="big">{money(d.status.equity)}</div>
+              <div className="row small" style={{ marginTop: 6, justifyContent: 'flex-start', gap: 18, flexWrap: 'wrap' }}>
+                <span className={tone(d.today.pnl)}>Today {signed(d.today.pnl)}</span>
+                <span className={`${tone(d.unrealized)}`}>Open P&L {signed(d.unrealized)}</span>
+                <span className="muted">{d.today.trades} trades today</span>
+              </div>
+              <div className="grid g2" style={{ marginTop: 16, gap: 10 }}>
+                <button className="btn primary go" disabled={busy || active} onClick={() => control('start')}>{active ? 'TRADING ACTIVE' : 'START TRADING'}</button>
+                <button className="btn danger go" disabled={busy || !active} onClick={() => control('stop')}>STOP TRADING</button>
+              </div>
+              <div className="row" style={{ marginTop: 10 }}>
+                <span className="tiny muted">Stop only blocks new entries; open trades keep their stop-loss / take-profit.</span>
+                <button className="btn sm ghost" disabled={busy || d.positions.length === 0} onClick={closeAll}>Close all</button>
+              </div>
+            </>
+          ) : <Skeleton h={150} />}
+        </Card>
+      )}
 
-      <div className="card" style={{ marginBottom: 12 }}>
-        <h3>Automated Trading</h3>
-        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-          <button className="btn start" style={{ flex: 1, minWidth: 130 }} disabled={busy || status?.tradingActive} onClick={() => control('start')}>
-            START TRADING
-          </button>
-          <button className="btn stop" style={{ flex: 1, minWidth: 130 }} disabled={busy || !status?.tradingActive} onClick={() => control('stop')}>
-            STOP TRADING
-          </button>
-          <button
-            className="btn danger"
-            style={{ flex: 1, minWidth: 130 }}
-            disabled={busy || positions.length === 0}
-            onClick={() => apiFetch('/api/trading/close-all', { method: 'POST' }).then(load)}
-          >
-            CLOSE ALL
-          </button>
-        </div>
-      </div>
-
-      <div className="mission-hero" style={{ marginBottom: 12 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
-          <h3 style={{ margin: 0 }}>Profit Mission</h3>
-          <Link to="/missions" className="btn small">Manage</Link>
-        </div>
-        {mission ? (
-          <div>
-            <div className="amounts">
-              <div><div className="stat-value">${fmt(mission.currentCapital)}</div><div className="stat-label">Current</div></div>
-              <div><div className="stat-value">${fmt(mission.targetCapital)}</div><div className="stat-label">Target</div></div>
-              <div><div className={`stat-value ${pnlCls(mission.realizedProfit)}`}>${fmt(mission.realizedProfit)}</div><div className="stat-label">Realized</div></div>
+      <Link to="/missions">
+        <Card className="hero" title="Profit Mission" action={<span className="small pos">{m ? m.status : 'Start one'} ›</span>}>
+          {m ? (
+            <div className="row" style={{ gap: 18 }}>
+              <Ring pct={m.progressPct} size={118} stroke={11} label={`${m.progressPct.toFixed(0)}%`} />
+              <div style={{ flex: 1 }}>
+                <div className="stat"><div className="label">Current → Target</div><div className="value" style={{ fontSize: 20 }}>{money(m.currentCapital)} → {money(m.targetCapital)}</div></div>
+                <div className="small muted" style={{ marginTop: 6 }}>Realized <b className={tone(m.realizedProfit)}>{signed(m.realizedProfit)}</b> · Unrealized <span className={tone(m.unrealizedProfit)}>{signed(m.unrealizedProfit)}</span></div>
+                <div className="small muted">{money(m.remaining)} to go</div>
+              </div>
             </div>
-            <div className="progress-wrap"><div className="progress-bar" style={{ width: `${mission.progressPct}%` }} /></div>
-            <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>{fmt(mission.progressPct)}% complete</div>
-          </div>
-        ) : (
-          <p className="empty">No mission yet — <Link to="/missions">create one</Link>.</p>
-        )}
+          ) : <div className="muted small">Set a capital-growth goal (for example $10 → $100) and let the bot work toward it with strict risk limits.</div>}
+        </Card>
+      </Link>
+
+      <div className="grid g2">
+        <Card title="Best opportunities" action={<Link to="/scanner" className="small muted">All ›</Link>}>
+          <OpportunityList items={opps} empty={market.error ? 'Backend unreachable' : 'No qualifying setups right now — the scanner keeps looking.'} />
+        </Card>
+        <Card title="Active positions" action={<Link to="/positions" className="small muted">Details ›</Link>}>
+          {session ? <PositionList items={d?.positions ?? []} /> : <div className="empty">Sign in to see positions</div>}
+        </Card>
       </div>
 
-      <div className="grid cols-2">
-        <div className="card">
-          <h3>Best Opportunities</h3>
-          {opportunities.length === 0 ? (
-            <p className="empty">Scanning markets…</p>
-          ) : (
-            <table>
-              <thead><tr><th>Symbol</th><th>Signal</th><th>Score</th></tr></thead>
-              <tbody>
-                {opportunities.map((o) => (
-                  <tr key={o.symbol}>
-                    <td>{o.symbol}</td>
-                    <td className={o.decision === 'LONG' ? 'pos' : 'neg'}>{o.decision}</td>
-                    <td>{o.score.toFixed(3)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
+      {d && (
+        <div className="grid g4">
+          <Stat label="Win rate" value={`${d.performance.winRate.toFixed(0)}%`} sub={`${d.performance.totalTrades} trades`} />
+          <Stat label="Net P&L" value={signed(d.performance.netPnl)} cls={tone(d.performance.netPnl)} sub="realized" />
+          <Stat label="Profit factor" value={d.performance.profitFactor.toFixed(2)} sub="gross win / loss" />
+          <Stat label="Max drawdown" value={money(d.performance.maxDrawdown)} sub="from peak" />
         </div>
+      )}
 
-        <div className="card">
-          <h3>Active Positions</h3>
-          {positions.length === 0 ? (
-            <p className="empty">No open positions.</p>
-          ) : (
-            <table>
-              <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Unrealized</th></tr></thead>
-              <tbody>
-                {positions.map((p) => (
-                  <tr key={p.positionId}>
-                    <td>{p.symbol}</td>
-                    <td className={p.side === 'long' ? 'pos' : 'neg'}>{p.side.toUpperCase()}</td>
-                    <td>{p.qty}</td>
-                    <td className={pnlCls(p.unrealizedPnl)}>${fmt(p.unrealizedPnl)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </div>
-      </div>
+      <Card title="Market engine" action={<span className="tiny muted">{market.data?.scanned ?? 0} markets analysed</span>}>
+        {market.data ? <FeedStrip feeds={market.data.exchanges} /> : <Skeleton h={30} />}
+      </Card>
     </div>
   );
 }

@@ -1,35 +1,61 @@
-"""Supabase service-role client used only server-side.
+"""Supabase service-role client (server-side only).
 
-The client is created once per process (singleton). Settings is a pydantic
-model, which is NOT hashable, so it cannot be used directly as an lru_cache
-key — that raised "TypeError: unhashable type: 'Settings'" on Railway.
-Instead we cache on the hashable settings values (url + service-role key)
-behind a lock, which keeps a single client instance without breaking the
-FastAPI lifespan or any existing call signature.
+If Supabase is not configured (or the client cannot be built) a ``NullDB`` is
+returned so the market engine and public API still run; routes that need the
+database answer 503 with a clear message instead of crashing the service.
 """
+import logging
 from threading import Lock
-from typing import Optional, Tuple
-
-from supabase import create_client
+from typing import Any, Optional, Tuple
 
 from app.config import Settings
 
-_client = None
+logger = logging.getLogger(__name__)
+
+_client: Any = None
 _cache_key: Optional[Tuple[str, str]] = None
 _lock = Lock()
 
 
-def get_supabase(settings: Settings):
-    """Return the process-wide Supabase client.
+class _Result:
+    data: list = []
 
-    Accepts a Settings object (same signature as before). Rebuilds the
-    client only if the underlying URL/key changed; otherwise returns the
-    cached instance.
-    """
+
+class _NullQuery:
+    def __getattr__(self, _name):
+        return lambda *a, **k: self
+
+    def execute(self):
+        return _Result()
+
+
+class NullDB:
+    """Stand-in used when Supabase is unavailable."""
+    is_null = True
+
+    def table(self, _name):
+        return _NullQuery()
+
+
+def get_supabase(settings: Settings):
     global _client, _cache_key
     key = (settings.supabase_url, settings.supabase_service_role_key)
     with _lock:
-        if _client is None or _cache_key != key:
-            _client = create_client(settings.supabase_url, settings.supabase_service_role_key)
-            _cache_key = key
+        if _client is not None and _cache_key == key:
+            return _client
+        if not all(key):
+            logger.error("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not set - running without a database")
+            _client, _cache_key = NullDB(), key
+            return _client
+        try:
+            from supabase import create_client
+            _client = create_client(*key)
+        except Exception as exc:
+            logger.error("Supabase client could not be created: %s", exc)
+            _client = NullDB()
+        _cache_key = key
         return _client
+
+
+def db_ready(db) -> bool:
+    return not getattr(db, "is_null", False)
